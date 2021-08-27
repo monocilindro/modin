@@ -11,6 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module houses API to operate on Modin DataFrame partitions that are pandas DataFrame(s)."""
+
 import numpy as np
 
 from modin.backends.pandas.query_compiler import PandasQueryCompiler
@@ -25,10 +27,10 @@ def unwrap_partitions(api_layer_object, axis=None, get_ip=False):
     ----------
     api_layer_object : DataFrame or Series
         The API layer object.
-    axis : None, 0 or 1. Default is None
+    axis : {None, 0, 1}, default: None
         The axis to unwrap partitions for (0 - row partitions, 1 - column partitions).
         If ``axis is None``, the partitions are unwrapped as they are currently stored.
-    get_ip : boolean. Default is False
+    get_ip : bool, default: False
         Whether to get node ip address to each partition or not.
 
     Returns
@@ -76,10 +78,8 @@ def unwrap_partitions(api_layer_object, axis=None, get_ip=False):
             f"Do not know how to unwrap '{actual_engine}' underlying partitions"
         )
     else:
-        partitions = (
-            api_layer_object._query_compiler._modin_frame._frame_mgr_cls.axis_partition(
-                api_layer_object._query_compiler._modin_frame._partitions, axis ^ 1
-            )
+        partitions = api_layer_object._query_compiler._modin_frame._partition_mgr_cls.axis_partition(
+            api_layer_object._query_compiler._modin_frame._partitions, axis ^ 1
         )
         return [
             part.force_materialization(get_ip=get_ip).unwrap(
@@ -89,7 +89,9 @@ def unwrap_partitions(api_layer_object, axis=None, get_ip=False):
         ]
 
 
-def from_partitions(partitions, axis):
+def from_partitions(
+    partitions, axis, index=None, columns=None, row_lengths=None, column_widths=None
+):
     """
     Create DataFrame from remote partitions.
 
@@ -99,26 +101,41 @@ def from_partitions(partitions, axis):
         A list of Ray.ObjectRef/Dask.Future to partitions depending on the engine used.
         Or a list of tuples of Ray.ObjectRef/Dask.Future to node ip addresses and partitions
         depending on the engine used (i.e. ``[(Ray.ObjectRef/Dask.Future, Ray.ObjectRef/Dask.Future), ...]``).
-    axis : None, 0 or 1
+    axis : {None, 0 or 1}
         The ``axis`` parameter is used to identify what are the partitions passed.
         You have to set:
 
         * ``axis=0`` if you want to create DataFrame from row partitions
         * ``axis=1`` if you want to create DataFrame from column partitions
         * ``axis=None`` if you want to create DataFrame from 2D list of partitions
+    index : sequence, optional
+        The index for the DataFrame. Is computed if not provided.
+    columns : sequence, optional
+        The columns for the DataFrame. Is computed if not provided.
+    row_lengths : list, optional
+        The length of each partition in the rows. The "height" of
+        each of the block partitions. Is computed if not provided.
+    column_widths : list, optional
+        The width of each partition in the columns. The "width" of
+        each of the block partitions. Is computed if not provided.
 
     Returns
     -------
-    DataFrame
+    modin.pandas.DataFrame
         DataFrame instance created from remote partitions.
+
+    Notes
+    -----
+    Pass `index`, `columns`, `row_lengths` and `column_widths` to avoid triggering
+    extra computations of the metadata when creating a DataFrame.
     """
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
-    factory = EngineDispatcher.get_engine()
+    factory = FactoryDispatcher.get_factory()
 
-    partition_class = factory.io_cls.frame_cls._frame_mgr_cls._partition_class
+    partition_class = factory.io_cls.frame_cls._partition_mgr_cls._partition_class
     partition_frame_class = factory.io_cls.frame_cls
-    partition_mgr_class = factory.io_cls.frame_cls._frame_mgr_cls
+    partition_mgr_class = factory.io_cls.frame_cls._partition_mgr_cls
 
     # Since we store partitions of Modin DataFrame as a 2D NumPy array we need to place
     # passed partitions to 2D NumPy array to pass it to internal Modin Frame class.
@@ -159,8 +176,24 @@ def from_partitions(partitions, axis):
             f"Got unacceptable value of axis {axis}. Possible values are {0}, {1} or {None}."
         )
 
-    index = partition_mgr_class.get_indices(0, parts, lambda df: df.axes[0])
-    columns = partition_mgr_class.get_indices(1, parts, lambda df: df.axes[1])
-    return DataFrame(
-        query_compiler=PandasQueryCompiler(partition_frame_class(parts, index, columns))
+    labels_axis_to_sync = None
+    if index is None:
+        labels_axis_to_sync = 1
+        index = partition_mgr_class.get_indices(0, parts, lambda df: df.axes[0])
+
+    if columns is None:
+        labels_axis_to_sync = 0 if labels_axis_to_sync is None else -1
+        columns = partition_mgr_class.get_indices(1, parts, lambda df: df.axes[1])
+
+    frame = partition_frame_class(
+        parts,
+        index,
+        columns,
+        row_lengths=row_lengths,
+        column_widths=column_widths,
     )
+
+    if labels_axis_to_sync != -1:
+        frame.synchronize_labels(axis=labels_axis_to_sync)
+
+    return DataFrame(query_compiler=PandasQueryCompiler(frame))

@@ -13,7 +13,7 @@
 
 import pandas
 
-__pandas_version__ = "1.2.3"
+__pandas_version__ = "1.3.2"
 
 if pandas.__version__ != __pandas_version__:
     import warnings
@@ -141,7 +141,7 @@ def _update_engine(publisher: Parameter):
                 )
 
             init_remote_ray(Backend.get())
-            # import EngineDispatcher here to initialize IO class
+            # import FactoryDispatcher here to initialize IO class
             # so it doesn't skew read_csv() timings later on
             import modin.data_management.factories.dispatcher  # noqa: F401
         else:
@@ -183,6 +183,7 @@ from .io import (
     HDFStore,
     json_normalize,
     read_orc,
+    read_xml,
 )
 from .series import Series
 from .general import (

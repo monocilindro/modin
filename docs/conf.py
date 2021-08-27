@@ -7,14 +7,49 @@
 # http://www.sphinx-doc.org/en/stable/config
 
 # -- Project information -----------------------------------------------------
+import sys
+import os
+import types
+
+import ray
+# stub ray.remote to be a no-op so it doesn't shadow docstrings
+def noop_decorator(*args, **kwargs):
+    if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
+        # This is the case where the decorator is just @ray.remote without parameters.
+        return args[0]
+    return lambda cls_or_func: cls_or_func
+ray.remote = noop_decorator
+
+# fake modules if they're missing
+for mod_name in ("cudf", "cupy", "pyarrow.gandiva", "omniscidbe"):
+    try:
+        __import__(mod_name)
+    except ImportError:
+        sys.modules[mod_name] = types.ModuleType(
+            mod_name, f"fake {mod_name} for building docs"
+        )
+if not hasattr(sys.modules["cudf"], "DataFrame"):
+    sys.modules["cudf"].DataFrame = type("DataFrame", (object,), {})
+if not hasattr(sys.modules["omniscidbe"], "PyDbEngine"):
+    sys.modules["omniscidbe"].PyDbEngine = type("PyDbEngine", (object,), {})
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import modin
 
-project = u"Modin"
-copyright = u"2018-2021, Modin"
-author = u"Modin contributors"
+from modin.config.__main__ import export_config_help
+
+configs_file_path = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "flow/modin/configs_help.csv")
+)
+# Export configs help to create configs table in the docs/flow/modin/config.rst
+export_config_help(configs_file_path)
+
+project = "Modin"
+copyright = "2018-2021, Modin"
+author = "Modin contributors"
 
 # The short X.Y version
-version = u"{}".format(modin.__version__)
+version = "{}".format(modin.__version__)
 # The full version, including alpha/beta/rc tags
 release = version
 
@@ -32,11 +67,11 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
-    'sphinx.ext.todo',
-    'sphinx.ext.mathjax',
-    'sphinx.ext.githubpages',
-    'sphinx.ext.graphviz',
-    'sphinxcontrib.plantuml',
+    "sphinx.ext.todo",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.githubpages",
+    "sphinx.ext.graphviz",
+    "sphinxcontrib.plantuml",
     "sphinx_issues",
 ]
 
@@ -63,7 +98,7 @@ language = None
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path .
-exclude_patterns = [u"_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = "sphinx"
@@ -86,7 +121,11 @@ html_logo = "img/MODIN_ver2.png"
 # further.  For a list of options available for each theme, see the
 # documentation.
 #
-html_theme_options = {"sidebarwidth": 270, 'collapse_navigation': False}
+html_theme_options = {
+    "sidebarwidth": 270,
+    "collapse_navigation": False,
+    "navigation_depth": 4,
+}
 
 # Custom sidebar templates, must be a dictionary that maps document names
 # to template names.

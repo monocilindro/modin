@@ -10,7 +10,7 @@
     <p align="center"><b>To use Modin, replace the pandas import:</b></p>
 
 .. figure:: img/Modin_Pandas_Import.gif
-   :align: center   
+   :align: center
 
 Scale your pandas workflow by changing a single line of code
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -49,9 +49,9 @@ of the targets:
 
 .. code-block:: bash
 
-   pip install modin[ray] # Install Modin dependencies and Ray to run on Ray
-   pip install modin[dask] # Install Modin dependencies and Dask to run on Dask
-   pip install modin[all] # Install all of the above
+   pip install "modin[ray]" # Install Modin dependencies and Ray to run on Ray
+   pip install "modin[dask]" # Install Modin dependencies and Dask to run on Dask
+   pip install "modin[all]" # Install all of the above
 
 Modin will automatically detect which engine you have installed and use that for
 scheduling computation!
@@ -113,6 +113,9 @@ nature, you get a fast DataFrame at 1MB and 1TB+.
 
 **Modin is currently under active development. Requests and contributions are welcome!**
 
+**If you are interested in contributions please refer to 'developer documentation' section, where
+you can find 'Getting started' guide, system architecture and internal implementation details docs
+and lots of other useful information.**
 
 .. toctree::
    :caption: Installation
@@ -120,21 +123,29 @@ nature, you get a fast DataFrame at 1MB and 1TB+.
    installation
 
 .. toctree::
-   :caption: Using Modin
+   :caption: Getting Started
 
    using_modin
    out_of_core
-   modin_xgboost
 
 .. toctree::
    :caption: Examples
 
    examples/index
 
+.. toctree:: 
+   :caption: Experimental Features
+
+   experimental_features/index
+   experimental_features/modin_sql
+   experimental_features/spreadsheets_api
+   experimental_features/progress_bar
+   experimental_features/modin_xgboost
+   experimental_features/modin_in_the_cloud
+
 .. toctree::
    :caption: How is Modin different from ...?
 
-   comparisons/index
    comparisons/pandas
    comparisons/dask
    comparisons/spark
@@ -153,15 +164,15 @@ nature, you get a fast DataFrame at 1MB and 1TB+.
 
    contributing
    developer/architecture
-   developer/pandas/partition_api
+   developer/partition_api
 
 .. toctree::
    :caption: Engines, Backends, and APIs
 
    UsingPandasonRay/index
    UsingPandasonDask/index
+   UsingOmnisci/index
    UsingPyarrowonRay/index
-   UsingSQLonRay/index
 
 .. toctree::
    :caption: Help

@@ -11,6 +11,13 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""
+Module contains ``PandasQueryCompiler`` class.
+
+``PandasQueryCompiler`` is responsible for compiling efficient DataFrame algebra
+queries for the ``PandasFrame``.
+"""
+
 import numpy as np
 import pandas
 from pandas.core.common import is_bool_indexer
@@ -29,7 +36,12 @@ import warnings
 
 from modin.backends.base.query_compiler import BaseQueryCompiler
 from modin.error_message import ErrorMessage
-from modin.utils import try_cast_to_pandas, wrap_udf_function, hashable
+from modin.utils import (
+    try_cast_to_pandas,
+    wrap_udf_function,
+    hashable,
+    _inherit_docstrings,
+)
 from modin.data_management.functions import (
     FoldFunction,
     MapFunction,
@@ -42,6 +54,18 @@ from modin.data_management.functions import (
 
 
 def _get_axis(axis):
+    """
+    Build index labels getter of the specified axis.
+
+    Parameters
+    ----------
+    axis : {0, 1}
+        Axis to get labels from. 0 is for index and 1 is for column.
+
+    Returns
+    -------
+    callable(PandasQueryCompiler) -> pandas.Index
+    """
     if axis == 0:
         return lambda self: self._modin_frame.index
     else:
@@ -49,6 +73,18 @@ def _get_axis(axis):
 
 
 def _set_axis(axis):
+    """
+    Build index labels setter of the specified axis.
+
+    Parameters
+    ----------
+    axis : {0, 1}
+        Axis to set labels on. 0 is for index and 1 is for column.
+
+    Returns
+    -------
+    callable(PandasQueryCompiler)
+    """
     if axis == 0:
 
         def set_axis(self, idx):
@@ -63,7 +99,21 @@ def _set_axis(axis):
 
 
 def _str_map(func_name):
+    """
+    Build function that calls specified string function on frames ``str`` accessor.
+
+    Parameters
+    ----------
+    func_name : str
+        String function name to execute on ``str`` accessor.
+
+    Returns
+    -------
+    callable(pandas.DataFrame, *args, **kwargs) -> pandas.DataFrame
+    """
+
     def str_op_builder(df, *args, **kwargs):
+        """Apply specified function against `str` accessor of the passed frame."""
         str_s = df.squeeze(axis=1).str
         return getattr(pandas.Series.str, func_name)(str_s, *args, **kwargs).to_frame()
 
@@ -72,23 +122,25 @@ def _str_map(func_name):
 
 def _dt_prop_map(property_name):
     """
-    Create a function that call property of property `dt` of the series.
+    Build function that access specified property of the ``dt`` property of the passed frame.
 
     Parameters
     ----------
-    property_name
-        The property of `dt`, which will be applied.
+    property_name : str
+        Date-time property name to access.
 
     Returns
     -------
-        A callable function to be applied in the partitions
+    callable(pandas.DataFrame, *args, **kwargs) -> pandas.DataFrame
+        Function to be applied in the partitions.
 
     Notes
     -----
-    This applies non-callable properties of `Series.dt`.
+    This applies non-callable properties of ``Series.dt``.
     """
 
     def dt_op_builder(df, *args, **kwargs):
+        """Access specified date-time property of the passed frame."""
         prop_val = getattr(df.squeeze(axis=1).dt, property_name)
         if isinstance(prop_val, pandas.Series):
             return prop_val.to_frame()
@@ -102,23 +154,25 @@ def _dt_prop_map(property_name):
 
 def _dt_func_map(func_name):
     """
-    Create a function that call method of property `dt` of the series.
+    Build function that apply specified method against ``dt`` property of the passed frame.
 
     Parameters
     ----------
-    func_name
-        The method of `dt`, which will be applied.
+    func_name : str
+        Date-time function name to apply.
 
     Returns
     -------
-        A callable function to be applied in the partitions
+    callable(pandas.DataFrame, *args, **kwargs) -> pandas.DataFrame
+        Function to be applied in the partitions.
 
     Notes
     -----
-    This applies callable methods of `Series.dt`.
+    This applies callable methods of ``Series.dt``.
     """
 
     def dt_op_builder(df, *args, **kwargs):
+        """Apply specified function against ``dt`` accessor of the passed frame."""
         dt_s = df.squeeze(axis=1).dt
         return pandas.DataFrame(
             getattr(pandas.Series.dt, func_name)(dt_s, *args, **kwargs)
@@ -129,22 +183,26 @@ def _dt_func_map(func_name):
 
 def copy_df_for_func(func, display_name: str = None):
     """
-    Create a function that copies the dataframe, likely because `func` is inplace.
+    Build function that execute specified `func` against passed frame inplace.
+
+    Built function copies passed frame, applies `func` to the copy and returns
+    the modified frame.
 
     Parameters
     ----------
-    func : callable
+    func : callable(pandas.DataFrame)
         The function, usually updates a dataframe inplace.
     display_name : str, optional
         The function's name, which is displayed by progress bar.
 
     Returns
     -------
-    callable
-        A callable function to be applied in the partitions
+    callable(pandas.DataFrame)
+        A callable function to be applied in the partitions.
     """
 
     def caller(df, *args, **kwargs):
+        """Apply specified function the passed frame inplace."""
         df = df.copy()
         func(df, *args, **kwargs)
         return df
@@ -154,35 +212,24 @@ def copy_df_for_func(func, display_name: str = None):
     return caller
 
 
+@_inherit_docstrings(BaseQueryCompiler)
 class PandasQueryCompiler(BaseQueryCompiler):
-    """This class implements the logic necessary for operating on partitions
-    with a Pandas backend. This logic is specific to Pandas."""
+    """
+    Query compiler for the pandas backend.
+
+    This class translates common query compiler API into the DataFrame Algebra
+    queries, that is supposed to be executed by :py:class:`~modin.engines.base.frame.data.PandasFrame`.
+
+    Parameters
+    ----------
+    modin_frame : PandasFrame
+        Modin Frame to query with the compiled queries.
+    """
 
     def __init__(self, modin_frame):
         self._modin_frame = modin_frame
 
     def default_to_pandas(self, pandas_op, *args, **kwargs):
-        """
-        Default to pandas behavior.
-
-        Parameters
-        ----------
-        pandas_op : callable
-            The operation to apply, must be compatible pandas DataFrame call
-        args
-            The arguments for the `pandas_op`
-        kwargs
-            The keyword arguments for the `pandas_op`
-
-        Returns
-        -------
-        PandasQueryCompiler
-            The result of the `pandas_op`, converted back to PandasQueryCompiler
-
-        Notes
-        -----
-        This operation takes a distributed object and converts it directly to pandas.
-        """
         op_name = getattr(pandas_op, "__name__", str(pandas_op))
         ErrorMessage.default_to_pandas(op_name)
         args = (a.to_pandas() if isinstance(a, type(self)) else a for a in args)
@@ -255,15 +302,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # future. TODO (devin-petersohn): Delay reindexing
 
     def concat(self, axis, other, **kwargs):
-        """Concatenates two objects together.
-
-        Args:
-            axis: The axis index object to join (0 for columns, 1 for index).
-            other: The other_index to concat with.
-
-        Returns:
-            Concatenated objects.
-        """
         if not isinstance(other, list):
             other = [other]
         assert all(
@@ -275,7 +313,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         join = kwargs.get("join", "outer")
         ignore_index = kwargs.get("ignore_index", False)
         other_modin_frame = [o._modin_frame for o in other]
-        new_modin_frame = self._modin_frame._concat(axis, other_modin_frame, join, sort)
+        new_modin_frame = self._modin_frame.concat(axis, other_modin_frame, join, sort)
         result = self.__constructor__(new_modin_frame)
         if ignore_index:
             if axis == 0:
@@ -289,7 +327,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     # Data Management Methods
     def free(self):
-        """In the future, this will hopefully trigger a cleanup of this object."""
         # TODO create a way to clean up this object.
         return
 
@@ -297,13 +334,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     # To NumPy
     def to_numpy(self, **kwargs):
-        """
-        Converts Modin DataFrame to NumPy array.
-
-        Returns
-        -------
-            NumPy array of the QueryCompiler.
-        """
         arr = self._modin_frame.to_numpy(**kwargs)
         ErrorMessage.catch_bugs_and_request_email(
             len(arr) != len(self.index) or len(arr[0]) != len(self.columns)
@@ -357,15 +387,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     )
 
     def where(self, cond, other, **kwargs):
-        """Gets values from this manager where cond is true else from other.
-
-        Args:
-            cond: Condition on which to evaluate values.
-
-        Returns:
-            New QueryCompiler with updated data and index.
-        """
-
         assert isinstance(
             cond, type(self)
         ), "Must have the same QueryCompiler subclass to perform this operation"
@@ -378,14 +399,14 @@ class PandasQueryCompiler(BaseQueryCompiler):
             def where_builder_first_pass(cond, other, **kwargs):
                 return cond.where(cond, other, **kwargs)
 
-            first_pass = cond._modin_frame._binary_op(
+            first_pass = cond._modin_frame.binary_op(
                 where_builder_first_pass, other._modin_frame, join_type="left"
             )
 
             def where_builder_second_pass(df, new_other, **kwargs):
                 return df.where(new_other.eq(True), new_other, **kwargs)
 
-            new_modin_frame = self._modin_frame._binary_op(
+            new_modin_frame = self._modin_frame.binary_op(
                 where_builder_second_pass, first_pass, join_type="left"
             )
         # This will be a Series of scalars to be applied based on the condition
@@ -395,29 +416,12 @@ class PandasQueryCompiler(BaseQueryCompiler):
             def where_builder_series(df, cond):
                 return df.where(cond, other, **kwargs)
 
-            new_modin_frame = self._modin_frame._binary_op(
+            new_modin_frame = self._modin_frame.binary_op(
                 where_builder_series, cond._modin_frame, join_type="left"
             )
         return self.__constructor__(new_modin_frame)
 
     def merge(self, right, **kwargs):
-        """
-        Merge DataFrame or named Series objects with a database-style join.
-
-        Parameters
-        ----------
-        right : PandasQueryCompiler
-            The query compiler of the right DataFrame to merge with.
-
-        Returns
-        -------
-        PandasQueryCompiler
-            A new query compiler that contains result of the merge.
-
-        Notes
-        -----
-        See pd.merge or pd.DataFrame.merge for more info on kwargs.
-        """
         how = kwargs.get("how", "inner")
         on = kwargs.get("on", None)
         left_on = kwargs.get("left_on", None)
@@ -435,7 +439,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
                 return pandas.merge(left, right, **kwargs)
 
             new_self = self.__constructor__(
-                self._modin_frame._apply_full_axis(1, map_func)
+                self._modin_frame.apply_full_axis(1, map_func)
             )
             is_reset_index = True
             if left_on and right_on:
@@ -469,23 +473,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
             return self.default_to_pandas(pandas.DataFrame.merge, right, **kwargs)
 
     def join(self, right, **kwargs):
-        """
-        Join columns of another DataFrame.
-
-        Parameters
-        ----------
-        right : BaseQueryCompiler
-            The query compiler of the right DataFrame to join with.
-
-        Returns
-        -------
-        BaseQueryCompiler
-            A new query compiler that contains result of the join.
-
-        Notes
-        -----
-        See pd.DataFrame.join for more info on kwargs.
-        """
         on = kwargs.get("on", None)
         how = kwargs.get("how", "left")
         sort = kwargs.get("sort", False)
@@ -497,7 +484,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
                 return pandas.DataFrame.join(left, right, **kwargs)
 
             new_self = self.__constructor__(
-                self._modin_frame._apply_full_axis(1, map_func)
+                self._modin_frame.apply_full_axis(1, map_func)
             )
             return new_self.sort_rows_by_column_values(on) if sort else new_self
         else:
@@ -507,18 +494,9 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     # Reindex/reset_index (may shuffle data)
     def reindex(self, axis, labels, **kwargs):
-        """Fits a new index for this Manager.
-
-        Args:
-            axis: The axis index object to target the reindex on.
-            labels: New labels to conform 'axis' on to.
-
-        Returns:
-            A new QueryCompiler with updated data and new index.
-        """
         new_index = self.index if axis else labels
         new_columns = labels if axis else self.columns
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis,
             lambda df: df.reindex(labels=labels, axis=axis, **kwargs),
             new_index=new_index,
@@ -527,11 +505,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def reset_index(self, **kwargs):
-        """Removes all levels from index and sets a default level_0 index.
-
-        Returns:
-            A new QueryCompiler with updated data and reset index.
-        """
         drop = kwargs.get("drop", False)
         level = kwargs.get("level", None)
         new_index = None
@@ -635,23 +608,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     def set_index_from_columns(
         self, keys: List[Hashable], drop: bool = True, append: bool = False
     ):
-        """Create new row labels from a list of columns.
-
-        Parameters
-        ----------
-        keys : list of hashable
-            The list of column names that will become the new index.
-        drop : boolean
-            Whether or not to drop the columns provided in the `keys` argument
-        append : boolean
-            Whether or not to add the columns in `keys` as new levels appended to the
-            existing index.
-
-        Returns
-        -------
-        PandasQueryCompiler
-            A new QueryCompiler with updated index.
-        """
         new_modin_frame = self._modin_frame.to_labels(keys)
         if append:
             arrays = []
@@ -695,26 +651,10 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # for simplicity of implementation.
 
     def transpose(self, *args, **kwargs):
-        """Transposes this QueryCompiler.
-
-        Returns:
-            Transposed new QueryCompiler.
-        """
         # Switch the index and columns and transpose the data within the blocks.
         return self.__constructor__(self._modin_frame.transpose())
 
     def columnarize(self):
-        """
-        Transposes this QueryCompiler if it has a single row but multiple columns.
-
-        This method should be called for QueryCompilers representing a Series object,
-        i.e. self.is_series_like() should be True.
-
-        Returns
-        -------
-        PandasQueryCompiler
-            Transposed new QueryCompiler or self.
-        """
         if len(self.columns) != 1 or (
             len(self.index) == 1 and self.index[0] == "__reduced__"
         ):
@@ -722,7 +662,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self
 
     def is_series_like(self):
-        """Return True if QueryCompiler has a single column or row"""
         return len(self.columns) == 1 or len(self.index) == 1
 
     # END Transpose
@@ -731,12 +670,14 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     def is_monotonic_decreasing(self):
         def is_monotonic_decreasing(df):
+            """Check whether data in the passed frame is monotonic decreasing."""
             return pandas.DataFrame([df.squeeze(axis=1).is_monotonic_decreasing])
 
         return self.default_to_pandas(is_monotonic_decreasing)
 
     def is_monotonic_increasing(self):
         def is_monotonic_increasing(df):
+            """Check whether data in the passed frame is monotonic increasing."""
             return pandas.DataFrame([df.squeeze(axis=1).is_monotonic_increasing])
 
         return self.default_to_pandas(is_monotonic_increasing)
@@ -790,6 +731,11 @@ class PandasQueryCompiler(BaseQueryCompiler):
         # Since `count(numeric_only=True)` discards all unknown "numeric" types, we can get incorrect
         # divisor inside the reduce function.
         def map_fn(df, **kwargs):
+            """
+            Perform Map phase of the `mean`.
+
+            Compute sum and number of elements in a given partition.
+            """
             result = pandas.DataFrame(
                 {
                     "sum": df.sum(axis=axis, skipna=skipna),
@@ -799,6 +745,12 @@ class PandasQueryCompiler(BaseQueryCompiler):
             return result if axis else result.T
 
         def reduce_fn(df, **kwargs):
+            """
+            Perform Reduce phase of the `mean`.
+
+            Compute sum for all the the partitions and divide it to
+            the total number of elements.
+            """
             sum_cols = df["sum"] if axis else df.loc["sum"]
             count_cols = df["count"] if axis else df.loc["count"]
 
@@ -815,14 +767,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         )(self, axis=axis, **kwargs)
 
     def value_counts(self, **kwargs):
-        """
-        Return a QueryCompiler of Series containing counts of unique values.
-
-        Returns
-        -------
-        PandasQueryCompiler
-        """
-
         def value_counts(df):
             return df.squeeze(axis=1).value_counts(**kwargs).to_frame()
 
@@ -844,19 +788,52 @@ class PandasQueryCompiler(BaseQueryCompiler):
     prod_min_count = ReductionFunction.register(pandas.DataFrame.prod)
     quantile_for_single_value = ReductionFunction.register(pandas.DataFrame.quantile)
     mad = ReductionFunction.register(pandas.DataFrame.mad)
-    to_datetime = ReductionFunction.register(
-        lambda df, *args, **kwargs: pandas.to_datetime(
-            df.squeeze(axis=1), *args, **kwargs
-        ),
-        axis=1,
-    )
+
+    def to_datetime(self, *args, **kwargs):
+        if len(self.columns) == 1:
+            return MapFunction.register(
+                # to_datetime has inplace side effects, see GH#3063
+                lambda df, *args, **kwargs: pandas.to_datetime(
+                    df.squeeze(axis=1), *args, **kwargs
+                ).to_frame()
+            )(self, *args, **kwargs)
+        else:
+            return ReductionFunction.register(pandas.to_datetime, axis=1)(
+                self, *args, **kwargs
+            )
 
     # END Reduction operations
 
     def _resample_func(
         self, resample_args, func_name, new_columns=None, df_op=None, *args, **kwargs
     ):
+        """
+        Resample underlying time-series data and apply aggregation on it.
+
+        Parameters
+        ----------
+        resample_args : list
+            Resample parameters in the format of ``modin.pandas.DataFrame.resample`` signature.
+        func_name : str
+            Aggregation function name to apply on resampler object.
+        new_columns : list of labels, optional
+            Actual column labels of the resulted frame, supposed to be a hint for the
+            Modin frame. If not specified will be computed automaticly.
+        df_op : callable(pandas.DataFrame) -> [pandas.DataFrame, pandas.Series], optional
+            Preprocessor function to apply to the passed frame before resampling.
+        *args : args
+            Arguments to pass to the aggregation function.
+        **kwargs : kwargs
+            Arguments to pass to the aggregation function.
+
+        Returns
+        -------
+        PandasQueryCompiler
+            New QueryCompiler containing the result of resample aggregation.
+        """
+
         def map_func(df, resample_args=resample_args):
+            """Resample time-series data of the passed frame and apply aggregation function on it."""
             if df_op is not None:
                 df = df_op(df)
             resampled_val = df.resample(*resample_args)
@@ -877,7 +854,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             else:
                 return val
 
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis=0, func=map_func, new_columns=new_columns
         )
         return self.__constructor__(new_modin_frame)
@@ -1165,7 +1142,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             )(self)
 
     def rolling_aggregate(self, rolling_args, func, *args, **kwargs):
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             0,
             lambda df: pandas.DataFrame(
                 df.rolling(*rolling_args).aggregate(func=func, *args, **kwargs)
@@ -1192,6 +1169,22 @@ class PandasQueryCompiler(BaseQueryCompiler):
             return pandas.DataFrame(df.unstack(level=level, fill_value=fill_value))
 
         def is_tree_like_or_1d(calc_index, valid_index):
+            """
+            Check whether specified index is a single dimensional or built in a tree manner.
+
+            Parameters
+            ----------
+            calc_index : pandas.Index
+                Frame index to check.
+            valid_index : pandas.Index
+                Frame index on the opposite from `calc_index` axis.
+
+            Returns
+            -------
+            bool
+                True if `calc_index` is not MultiIndex or MultiIndex and built in a tree manner.
+                False otherwise.
+            """
             if not isinstance(calc_index, pandas.MultiIndex):
                 return True
             actual_len = 1
@@ -1218,12 +1211,34 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             obj = self
 
-        new_modin_frame = obj._modin_frame._apply_full_axis(
+        new_modin_frame = obj._modin_frame.apply_full_axis(
             axis, map_func, new_columns=new_columns
         )
         result = self.__constructor__(new_modin_frame)
 
         def compute_index(index, columns, consider_index=True, consider_columns=True):
+            """
+            Compute new index for the unstacked frame.
+
+            Parameters
+            ----------
+            index : pandas.Index
+                Index of the original frame.
+            columns : pandas.Index
+                Columns of the original frame.
+            consider_index : bool, default: True
+                Whether original index contains duplicated values.
+                If True all duplicates will be droped.
+            consider_columns : bool, default: True
+                Whether original columns contains duplicated values.
+                If True all duplicates will be droped.
+
+            Returns
+            -------
+            pandas.Index
+                New index to use in the unstacked frame.
+            """
+
             def get_unique_level_values(index):
                 return [
                     index.get_level_values(lvl).unique()
@@ -1300,7 +1315,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             new_columns = None
 
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             1,
             lambda df: pandas.DataFrame(df.stack(level=level, dropna=dropna)),
             new_columns=new_columns,
@@ -1334,15 +1349,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
             pandas.to_numeric(df.squeeze(axis=1), *args, **kwargs)
         )
     )
-
-    def repeat(self, repeats):
-        def map_fn(df):
-            return pandas.DataFrame(df.squeeze(axis=1).repeat(repeats))
-
-        if isinstance(repeats, int) or (is_list_like(repeats) and len(repeats) == 1):
-            return MapFunction.register(map_fn, validate_index=True)(self)
-        else:
-            return self.__constructor__(self._modin_frame._apply_full_axis(0, map_fn))
 
     # END Map partitions operations
 
@@ -1394,18 +1400,12 @@ class PandasQueryCompiler(BaseQueryCompiler):
     str_upper = MapFunction.register(_str_map("upper"), dtypes="copy")
     str_wrap = MapFunction.register(_str_map("wrap"), dtypes="copy")
     str_zfill = MapFunction.register(_str_map("zfill"), dtypes="copy")
+    str___getitem__ = MapFunction.register(_str_map("__getitem__"), dtypes="copy")
 
     # END String map partitions operations
 
     def unique(self):
-        """Return unique values of Series object.
-
-        Returns
-        -------
-        ndarray
-            The unique values returned as a NumPy array.
-        """
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             0,
             lambda x: x.squeeze(axis=1).unique(),
             new_columns=self.columns,
@@ -1413,16 +1413,8 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def searchsorted(self, **kwargs):
-        """
-        Return a QueryCompiler with value/values indicies, which they should be inserted
-        to maintain order of the passed Series.
-
-        Returns
-        -------
-        PandasQueryCompiler
-        """
-
         def searchsorted(df):
+            """Apply `searchsorted` function to a single partition."""
             result = df.squeeze(axis=1).searchsorted(**kwargs)
             if not is_list_like(result):
                 result = [result]
@@ -1488,9 +1480,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     dt_days = MapFunction.register(_dt_prop_map("days"))
     dt_microseconds = MapFunction.register(_dt_prop_map("microseconds"))
     dt_nanoseconds = MapFunction.register(_dt_prop_map("nanoseconds"))
-    dt_components = MapFunction.register(
-        _dt_prop_map("components"), validate_columns=True
-    )
     dt_qyear = MapFunction.register(_dt_prop_map("qyear"))
     dt_start_time = MapFunction.register(_dt_prop_map("start_time"))
     dt_end_time = MapFunction.register(_dt_prop_map("end_time"))
@@ -1499,27 +1488,13 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # END Dt map partitions operations
 
     def astype(self, col_dtypes, **kwargs):
-        """Converts columns dtypes to given dtypes.
-
-        Args:
-            col_dtypes: Dictionary of {col: dtype,...} where col is the column
-                name and dtype is a numpy dtype.
-
-        Returns:
-            DataFrame with updated dtypes.
-        """
         return self.__constructor__(self._modin_frame.astype(col_dtypes))
 
     # Column/Row partitions reduce operations
 
     def first_valid_index(self):
-        """Returns index of first non-NaN/NULL value.
-
-        Return:
-            Scalar of index name.
-        """
-
         def first_valid_index_builder(df):
+            """Get the position of the first valid index in a single partition."""
             return df.set_axis(
                 pandas.RangeIndex(len(df.index)), axis="index", inplace=False
             ).apply(lambda df: df.first_valid_index())
@@ -1529,7 +1504,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         # `squeeze` will convert it to a scalar.
         first_result = (
             self.__constructor__(
-                self._modin_frame._fold_reduce(0, first_valid_index_builder)
+                self._modin_frame.fold_reduce(0, first_valid_index_builder)
             )
             .min(axis=1)
             .to_pandas()
@@ -1538,13 +1513,8 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.index[first_result]
 
     def last_valid_index(self):
-        """Returns index of last non-NaN/NULL value.
-
-        Return:
-            Scalar of index name.
-        """
-
         def last_valid_index_builder(df):
+            """Get the position of the last valid index in a single partition."""
             return df.set_axis(
                 pandas.RangeIndex(len(df.index)), axis="index", inplace=False
             ).apply(lambda df: df.last_valid_index())
@@ -1554,7 +1524,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         # `squeeze` will convert it to a scalar.
         first_result = (
             self.__constructor__(
-                self._modin_frame._fold_reduce(0, last_valid_index_builder)
+                self._modin_frame.fold_reduce(0, last_valid_index_builder)
             )
             .max(axis=1)
             .to_pandas()
@@ -1570,11 +1540,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # This will return a new QueryCompiler object which the front end will handle.
 
     def describe(self, **kwargs):
-        """Generates descriptive statistics.
-
-        Returns:
-            DataFrame object containing the descriptive statistics of the DataFrame.
-        """
         # Use pandas to calculate the correct columns
         empty_df = (
             pandas.DataFrame(columns=self.columns)
@@ -1597,10 +1562,11 @@ class PandasQueryCompiler(BaseQueryCompiler):
                     break
 
         def describe_builder(df, internal_indices=[]):
+            """Apply `describe` function to the subset of columns in a single partition."""
             return df.iloc[:, internal_indices].describe(**kwargs)
 
         return self.__constructor__(
-            self._modin_frame._apply_full_axis_select_indices(
+            self._modin_frame.apply_full_axis_select_indices(
                 0,
                 describe_builder,
                 empty_df.columns,
@@ -1627,11 +1593,9 @@ class PandasQueryCompiler(BaseQueryCompiler):
         kwargs["lower"] = lower
         axis = kwargs.get("axis", 0)
         if is_list_like(lower) or is_list_like(upper):
-            new_modin_frame = self._modin_frame._fold(
-                axis, lambda df: df.clip(**kwargs)
-            )
+            new_modin_frame = self._modin_frame.fold(axis, lambda df: df.clip(**kwargs))
         else:
-            new_modin_frame = self._modin_frame._map(lambda df: df.clip(**kwargs))
+            new_modin_frame = self._modin_frame.map(lambda df: df.clip(**kwargs))
         return self.__constructor__(new_modin_frame)
 
     def corr(self, method="pearson", min_periods=1):
@@ -1650,21 +1614,22 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     def _nancorr(self, min_periods=1, cov=False):
         """
-        Compute either pairwise covariance or pairwise correlation of columns,
-        considering NA/null values the same like pandas does.
+        Compute either pairwise covariance or pairwise correlation of columns.
+
+        This function considers NA/null values the same like pandas does.
 
         Parameters
         ----------
-        min_periods : int, default 1
+        min_periods : int, default: 1
             Minimum number of observations required per pair of columns
             to have a valid result.
-        cov : boolean, default False
+        cov : boolean, default: False
             Either covariance or correlation should be computed.
 
         Returns
         -------
         PandasQueryCompiler
-            The covariance or correlation matrix of the series of the DataFrame.
+            The covariance or correlation matrix.
         """
         other = self.to_numpy()
         other_mask = self._isfinite().to_numpy()
@@ -1674,6 +1639,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             min_periods = 1
 
         def map_func(df):
+            """Compute covariance or correlation matrix for the passed frame."""
             df = df.to_numpy()
             n_rows = df.shape[0]
             df_mask = np.isfinite(df)
@@ -1714,29 +1680,12 @@ class PandasQueryCompiler(BaseQueryCompiler):
         columns = self.columns
         index = columns.copy()
         transponed_self = self.transpose()
-        new_modin_frame = transponed_self._modin_frame._apply_full_axis(
+        new_modin_frame = transponed_self._modin_frame.apply_full_axis(
             1, map_func, new_index=index, new_columns=columns
         )
         return transponed_self.__constructor__(new_modin_frame)
 
     def dot(self, other, squeeze_self=None, squeeze_other=None):
-        """
-        Computes the matrix multiplication of self and other.
-
-        Parameters
-        ----------
-            other : PandasQueryCompiler or NumPy array
-                The other query compiler or NumPy array to matrix multiply with self.
-            squeeze_self : boolean
-                The flag to squeeze self.
-            squeeze_other : boolean
-                The flag to squeeze other (this flag is applied if other is query compiler).
-
-        Returns
-        -------
-        PandasQueryCompiler
-            A new query compiler that contains result of the matrix multiply.
-        """
         if isinstance(other, PandasQueryCompiler):
             other = (
                 other.to_pandas().squeeze(axis=1)
@@ -1745,6 +1694,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             )
 
         def map_func(df, other=other, squeeze_self=squeeze_self):
+            """Compute matrix multiplication of the passed frames."""
             result = df.squeeze(axis=1).dot(other) if squeeze_self else df.dot(other)
             if is_list_like(result):
                 return pandas.DataFrame(result)
@@ -1765,13 +1715,39 @@ class PandasQueryCompiler(BaseQueryCompiler):
             new_columns = ["__reduced__"] if num_cols == 1 else None
             axis = 1
 
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis, map_func, new_index=new_index, new_columns=new_columns
         )
         return self.__constructor__(new_modin_frame)
 
     def _nsort(self, n, columns=None, keep="first", sort_type="nsmallest"):
+        """
+        Return first N rows of the data sorted in the specified order.
+
+        Parameters
+        ----------
+        n : int
+            Number of rows to return.
+        columns : list of labels, optional
+            Column labels to sort data by.
+        keep : {"first", "last", "all"}, default: "first"
+            How to pick first rows in case of duplicated values:
+            - "first": prioritize first occurence.
+            - "last": prioritize last occurence.
+            - "all": do not drop any duplicates, even if it means selecting more than `n` rows.
+        sort_type : {"nsmallest", "nlargest"}, default: "nsmallest"
+            "nsmallest" means sort in descending order, "nlargest" means
+            sort in ascending order.
+
+        Returns
+        -------
+        PandasQueryCompiler
+            New QueryCompiler containing the first N rows of the data
+            sorted in the given order.
+        """
+
         def map_func(df, n=n, keep=keep, columns=columns):
+            """Return first `N` rows of the sorted data for a single partition."""
             if columns is None:
                 return pandas.DataFrame(
                     getattr(pandas.Series, sort_type)(
@@ -1787,7 +1763,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             new_columns = self.columns
 
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis=0, func=map_func, new_columns=new_columns
         )
         return self.__constructor__(new_modin_frame)
@@ -1799,14 +1775,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self._nsort(sort_type="nlargest", *args, **kwargs)
 
     def eval(self, expr, **kwargs):
-        """Returns a new QueryCompiler with expr evaluated on columns.
-
-        Args:
-            expr: The string expression to evaluate.
-
-        Returns:
-            A new QueryCompiler with new columns after applying expr.
-        """
         # Make a copy of columns and eval on the copy to determine if result type is
         # series or not
         empty_eval = (
@@ -1820,7 +1788,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             )
         else:
             new_columns = empty_eval.columns
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             1,
             lambda df: pandas.DataFrame(df.eval(expr, inplace=False, **kwargs)),
             new_index=self.index,
@@ -1829,14 +1797,10 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def mode(self, **kwargs):
-        """Returns a new QueryCompiler with modes calculated for each label along given axis.
-
-        Returns:
-            A new QueryCompiler with modes calculated.
-        """
         axis = kwargs.get("axis", 0)
 
         def mode_builder(df):
+            """Compute modes for a single partition."""
             result = pandas.DataFrame(df.mode(**kwargs))
             # We return a dataframe with the same shape as the input to ensure
             # that all the partitions will be the same shape
@@ -1854,53 +1818,105 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             new_index = self.index
             new_columns = pandas.RangeIndex(len(self.columns))
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis, mode_builder, new_index=new_index, new_columns=new_columns
         )
         return self.__constructor__(new_modin_frame).dropna(axis=axis, how="all")
 
     def fillna(self, **kwargs):
-        """Replaces NaN values with the method provided.
-
-        Returns:
-            A new QueryCompiler with null values filled.
-        """
+        squeeze_self = kwargs.pop("squeeze_self", False)
+        squeeze_value = kwargs.pop("squeeze_value", False)
         axis = kwargs.get("axis", 0)
-        value = kwargs.get("value")
+        value = kwargs.pop("value")
         method = kwargs.get("method", None)
         limit = kwargs.get("limit", None)
         full_axis = method is not None or limit is not None
-        if isinstance(value, dict):
-            kwargs.pop("value")
+        if isinstance(value, BaseQueryCompiler):
+            if squeeze_self:
+                # Self is a Series type object
+                if full_axis:
+                    value = value.to_pandas().squeeze(axis=1)
 
-            def fillna(df):
-                func_dict = {c: value[c] for c in value if c in df.columns}
-                return df.fillna(value=func_dict, **kwargs)
+                    def fillna_builder(series):
+                        # `limit` parameter works only on `Series` type, so we have to squeeze both objects to get
+                        # correct behavior.
+                        return series.squeeze(axis=1).fillna(value=value, **kwargs)
+
+                    new_modin_frame = self._modin_frame.apply_full_axis(
+                        0, fillna_builder
+                    )
+                else:
+
+                    def fillna_builder(series, value_arg):
+                        # Both arguments for this function are 1-column `DataFrames` which denote `Series` type.
+                        # Because they are both of the same type, it is not necessary to convert either of them into
+                        # `Series` by squeezing since `fillna` works perfectly in the same way on 1-column `DataFrame`
+                        # objects (when `limit` parameter is absent) as it works on two `Series`.
+                        return series.fillna(value=value_arg, **kwargs)
+
+                    new_modin_frame = self._modin_frame.binary_op(
+                        fillna_builder, value._modin_frame, join_type="left"
+                    )
+
+                return self.__constructor__(new_modin_frame)
+            else:
+                # Self is a DataFrame type object
+                if squeeze_value:
+                    # Value is Series type object
+                    value = value.to_pandas().squeeze(axis=1)
+
+                    def fillna(df):
+                        return df.fillna(value=value, **kwargs)
+
+                    # Continue to end of this function
+
+                else:
+                    # Value is a DataFrame type object
+                    def fillna_builder(df, r):
+                        return df.fillna(value=r, **kwargs)
+
+                    new_modin_frame = self._modin_frame.broadcast_apply(
+                        0, fillna_builder, value._modin_frame
+                    )
+                    return self.__constructor__(new_modin_frame)
+
+        elif isinstance(value, dict):
+            if squeeze_self:
+
+                # For Series dict works along the index.
+                def fillna(df):
+                    return pandas.DataFrame(
+                        df.squeeze(axis=1).fillna(value=value, **kwargs)
+                    )
+
+            else:
+
+                # For DataFrames dict works along columns, all columns have to be present.
+                def fillna(df):
+                    func_dict = {
+                        col: val for (col, val) in value.items() if col in df.columns
+                    }
+                    return df.fillna(value=func_dict, **kwargs)
 
         else:
 
             def fillna(df):
-                return df.fillna(**kwargs)
+                return df.fillna(value=value, **kwargs)
 
         if full_axis:
-            new_modin_frame = self._modin_frame._fold(axis, fillna)
+            new_modin_frame = self._modin_frame.fold(axis, fillna)
         else:
-            new_modin_frame = self._modin_frame._map(fillna)
+            new_modin_frame = self._modin_frame.map(fillna)
         return self.__constructor__(new_modin_frame)
 
     def quantile_for_list_of_values(self, **kwargs):
-        """Returns Manager containing quantiles along an axis for numeric columns.
-
-        Returns:
-            QueryCompiler containing quantiles of original QueryCompiler along an axis.
-        """
         axis = kwargs.get("axis", 0)
         q = kwargs.get("q")
         numeric_only = kwargs.get("numeric_only", True)
         assert isinstance(q, (pandas.Series, np.ndarray, pandas.Index, list))
 
         if numeric_only:
-            new_columns = self._modin_frame._numeric_columns()
+            new_columns = self._modin_frame.numeric_columns()
         else:
             new_columns = [
                 col
@@ -1930,7 +1946,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             new_columns = pandas.Float64Index(q)
         else:
             q_index = pandas.Float64Index(q)
-        new_modin_frame = query_compiler._modin_frame._apply_full_axis(
+        new_modin_frame = query_compiler._modin_frame.apply_full_axis(
             axis,
             lambda df: quantile_builder(df, **kwargs),
             new_index=q_index,
@@ -1941,15 +1957,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return result.transpose() if axis == 1 else result
 
     def query(self, expr, **kwargs):
-        """Query columns of the QueryCompiler with a boolean expression.
-
-        Args:
-            expr: Boolean expression to query the columns with.
-
-        Returns:
-            QueryCompiler containing the rows where the boolean expression is satisfied.
-        """
-
         def query_builder(df, **kwargs):
             return df.query(expr, inplace=False, **kwargs)
 
@@ -1958,14 +1965,9 @@ class PandasQueryCompiler(BaseQueryCompiler):
         )
 
     def rank(self, **kwargs):
-        """Computes numerical rank along axis. Equal values are set to the average.
-
-        Returns:
-            QueryCompiler containing the ranks of the values along an axis.
-        """
         axis = kwargs.get("axis", 0)
         numeric_only = True if axis else kwargs.get("numeric_only", False)
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis,
             lambda df: df.rank(**kwargs),
             new_index=self.index,
@@ -1975,11 +1977,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def sort_index(self, **kwargs):
-        """Sorts the data with respect to either the columns or the indices.
-
-        Returns:
-            QueryCompiler containing the data sorted by columns or indices.
-        """
         axis = kwargs.pop("axis", 0)
         level = kwargs.pop("level", None)
         sort_remaining = kwargs.pop("sort_remaining", True)
@@ -2007,7 +2004,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             new_index = pandas.Series(self.index).sort_values(**kwargs)
             new_columns = self.columns
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis,
             lambda df: df.sort_index(
                 axis=axis, level=level, sort_remaining=sort_remaining, **kwargs
@@ -2035,6 +2032,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             var_name = "variable"
 
         def _convert_to_list(x):
+            """Convert passed object to a list."""
             if is_list_like(x):
                 x = [*x]
             elif x is not None:
@@ -2054,6 +2052,28 @@ class PandasQueryCompiler(BaseQueryCompiler):
             to_broadcast = None
 
         def applyier(df, internal_indices, other=[], internal_other_indices=[]):
+            """
+            Apply `melt` function to a single partition.
+
+            Parameters
+            ----------
+            df : pandas.DataFrame
+                Partition of the self frame.
+            internal_indices : list of ints
+                Positional indices of columns in this particular partition which
+                represents `value_vars` columns in the source frame.
+            other : pandas.DataFrame
+                Broadcasted partition which contains `id_vars` columns of the
+                source frame.
+            internal_other_indices : list of ints
+                Positional indices of columns in `other` partition which
+                represents `id_vars` columns in the source frame.
+
+            Returns
+            -------
+            pandas.DataFrame
+                The result of the `melt` function for this particular partition.
+            """
             if len(other):
                 other = pandas.concat(other, axis=1)
                 columns_to_add = other.columns.difference(df.columns)
@@ -2099,19 +2119,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     # __getitem__ methods
     def getitem_array(self, key):
-        """
-        Get column or row data specified by key.
-
-        Parameters
-        ----------
-        key : PandasQueryCompiler, numpy.ndarray, pandas.Index or list
-            Target numeric indices or labels by which to retrieve data.
-
-        Returns
-        -------
-        PandasQueryCompiler
-            A new Query Compiler.
-        """
         # TODO: dont convert to pandas for array indexing
         if isinstance(key, type(self)):
             key = key.to_pandas().squeeze(axis=1)
@@ -2149,16 +2156,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
             return self.getitem_column_array(key)
 
     def getitem_column_array(self, key, numeric=False):
-        """Get column data for target labels.
-
-        Args:
-            key: Target labels by which to retrieve data.
-            numeric: A boolean representing whether or not the key passed in represents
-                the numeric index or the named index.
-
-        Returns:
-            A new QueryCompiler.
-        """
         # Convert to list for type checking
         if numeric:
             new_modin_frame = self._modin_frame.mask(col_numeric_idx=key)
@@ -2167,30 +2164,53 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def getitem_row_array(self, key):
-        """Get row data for target labels.
-
-        Args:
-            key: Target numeric indices by which to retrieve data.
-
-        Returns:
-            A new QueryCompiler.
-        """
         return self.__constructor__(self._modin_frame.mask(row_numeric_idx=key))
 
     def setitem(self, axis, key, value):
-        """Set the column defined by `key` to the `value` provided.
-
-        Args:
-            key: The column name to set.
-            value: The value to set the column to.
-
-        Returns:
-             A new QueryCompiler
-        """
         return self._setitem(axis=axis, key=key, value=value, how=None)
 
     def _setitem(self, axis, key, value, how="inner"):
+        """
+        Set the row/column defined by `key` to the `value` provided.
+
+        In contrast with `setitem` with this function you can specify how
+        to handle non-aligned `self` and `value`.
+
+        Parameters
+        ----------
+        axis : {0, 1}
+            Axis to set `value` along. 0 means set row, 1 means set column.
+        key : label
+            Row/column label to set `value` in.
+        value : PandasQueryCompiler, list-like or scalar
+            Define new row/column value.
+        how : {"inner", "outer", "left", "right", None}, default: "inner"
+            Type of join to perform if specified axis of `self` and `value` are not
+            equal. If `how` is `None`, reindex `value` with `self` labels without joining.
+
+        Returns
+        -------
+        BaseQueryCompiler
+            New QueryCompiler with updated `key` value.
+        """
+
         def setitem_builder(df, internal_indices=[]):
+            """
+            Set the row/column to the `value` in a single partition.
+
+            Parameters
+            ----------
+            df : pandas.DataFrame
+                Partition of the self frame.
+            internal_indices : list of ints
+                Positional indices of rows/columns in this particular partition
+                which represents `key` in the source frame.
+
+            Returns
+            -------
+            pandas.DataFrame
+                Partition data with updated values.
+            """
             df = df.copy()
             if len(internal_indices) == 1:
                 if axis == 0:
@@ -2211,10 +2231,10 @@ class PandasQueryCompiler(BaseQueryCompiler):
             idx = self.get_axis(axis ^ 1).get_indexer_for([key])[0]
             return self.insert_item(axis ^ 1, idx, value, how, replace=True)
 
-        # TODO: rework by passing list-like values to `_apply_select_indices`
+        # TODO: rework by passing list-like values to `apply_select_indices`
         # as an item to distribute
         if is_list_like(value):
-            new_modin_frame = self._modin_frame._apply_full_axis_select_indices(
+            new_modin_frame = self._modin_frame.apply_full_axis_select_indices(
                 axis,
                 setitem_builder,
                 [key],
@@ -2223,7 +2243,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
                 keep_remaining=True,
             )
         else:
-            new_modin_frame = self._modin_frame._apply_select_indices(
+            new_modin_frame = self._modin_frame.apply_select_indices(
                 axis,
                 setitem_builder,
                 [key],
@@ -2238,12 +2258,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # Drop/Dropna
     # This will change the shape of the resulting data.
     def dropna(self, **kwargs):
-        """Returns a new QueryCompiler with null values dropped along given axis.
-
-        Return:
-            a new QueryCompiler
-        """
-
         return self.__constructor__(
             self._modin_frame.filter_full_axis(
                 kwargs.get("axis", 0) ^ 1,
@@ -2252,15 +2266,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
         )
 
     def drop(self, index=None, columns=None):
-        """Remove row data for target index and columns.
-
-        Args:
-            index: Target index to drop.
-            columns: Target columns to drop.
-
-        Returns:
-            A new QueryCompiler.
-        """
         if index is not None:
             # The unique here is to avoid duplicating rows with the same name
             index = np.sort(
@@ -2286,17 +2291,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # return a new one from here and let the front end handle the inplace
     # update.
     def insert(self, loc, column, value):
-        """Insert new column data.
-
-        Args:
-            loc: Insertion index.
-            column: Column labels to insert.
-            value: Dtype object values to insert.
-
-        Returns:
-            A new PandasQueryCompiler with new data inserted.
-        """
-
         if isinstance(value, type(self)):
             value.columns = [column]
             return self.insert_item(axis=1, loc=loc, value=value, how=None)
@@ -2307,13 +2301,24 @@ class PandasQueryCompiler(BaseQueryCompiler):
             value = [value] * len(self.index)
 
         def insert(df, internal_indices=[]):
+            """
+            Insert new column to the partition.
+
+            Parameters
+            ----------
+            df : pandas.DataFrame
+                Partition of the self frame.
+            internal_indices : list of ints
+                Positional index of the column in this particular partition
+                to insert new column after.
+            """
             internal_idx = int(internal_indices[0])
             df.insert(internal_idx, column, value)
             return df
 
-        # TODO: rework by passing list-like values to `_apply_select_indices`
+        # TODO: rework by passing list-like values to `apply_select_indices`
         # as an item to distribute
-        new_modin_frame = self._modin_frame._apply_full_axis_select_indices(
+        new_modin_frame = self._modin_frame.apply_full_axis_select_indices(
             0,
             insert,
             numeric_indices=[loc],
@@ -2329,15 +2334,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
     # There is a wide range of behaviors that are supported, so a lot of the
     # logic can get a bit convoluted.
     def apply(self, func, axis, *args, **kwargs):
-        """Apply func across given axis.
-
-        Args:
-            func: The function to apply.
-            axis: Target axis to apply the function along.
-
-        Returns:
-            A new PandasQueryCompiler.
-        """
         # if any of args contain modin object, we should
         # convert it to pandas
         args = try_cast_to_pandas(args)
@@ -2353,32 +2349,57 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             pass
 
+    # FIXME: `_apply_text_func_elementwise` duplicates most of the logic of `_callable_func`,
+    # these methods should be combined.
     def _apply_text_func_elementwise(self, func, axis, *args, **kwargs):
-        """Apply func passed as str across given axis in elementwise manner.
+        """
+        Apply passed string function to each row/column.
 
-        Args:
-            func: The function to apply.
-            axis: Target axis to apply the function along.
+        Parameters
+        ----------
+        func : str
+            Function name to apply.
+        axis : {0, 1}
+            Target axis to apply function along. 0 means apply to columns,
+            1 means apply to rows.
+        *args : args
+            Arguments to pass to the specified function.
+        **kwargs : kwargs
+            Arguments to pass to the specified function.
 
-        Returns:
-            A new PandasQueryCompiler.
+        Returns
+        -------
+        PandasQueryCompiler
+            New QueryCompiler containing the results of passed function
+            for each row/column.
         """
         assert isinstance(func, str)
         kwargs["axis"] = axis
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis, lambda df: df.apply(func, *args, **kwargs)
         )
         return self.__constructor__(new_modin_frame)
 
     def _dict_func(self, func, axis, *args, **kwargs):
-        """Apply function to certain indices across given axis.
+        """
+        Apply passed functions to the specified rows/columns.
 
-        Args:
-            func: The function to apply.
-            axis: Target axis to apply the function along.
+        Parameters
+        ----------
+        func : dict(label) -> [callable, str]
+            Dictionary that maps axis labels to the function to apply against them.
+        axis : {0, 1}
+            Target axis to apply functions along. 0 means apply to columns,
+            1 means apply to rows.
+        *args : args
+            Arguments to pass to the specified functions.
+        **kwargs : kwargs
+            Arguments to pass to the specified functions.
 
-        Returns:
-            A new PandasQueryCompiler.
+        Returns
+        -------
+        PandasQueryCompiler
+            New QueryCompiler containing the results of passed functions.
         """
         if "axis" not in kwargs:
             kwargs["axis"] = axis
@@ -2390,26 +2411,31 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
         func = {k: wrap_udf_function(v) if callable(v) else v for k, v in func.items()}
         return self.__constructor__(
-            self._modin_frame._apply_full_axis_select_indices(
+            self._modin_frame.apply_full_axis_select_indices(
                 axis, dict_apply_builder, func, keep_remaining=False
             )
         )
 
     def _list_like_func(self, func, axis, *args, **kwargs):
         """
-        Apply list-like function across given axis.
+        Apply passed functions to each row/column.
 
         Parameters
         ----------
-            func : list-like
-                The function to apply.
-            axis : 0 or 1 (0 - index, 1 - columns)
-                Target axis to apply the function along.
+        func : list of callable
+            List of functions to apply against each row/column.
+        axis : {0, 1}
+            Target axis to apply functions along. 0 means apply to columns,
+            1 means apply to rows.
+        *args : args
+            Arguments to pass to the specified functions.
+        **kwargs : kwargs
+            Arguments to pass to the specified functions.
 
         Returns
         -------
         PandasQueryCompiler
-            A new QueryCompiler.
+            New QueryCompiler containing the results of passed functions.
         """
         # When the function is list-like, the function names become the index/columns
         new_index = (
@@ -2423,7 +2449,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             else self.columns
         )
         func = [wrap_udf_function(f) if callable(f) else f for f in func]
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis,
             lambda df: pandas.DataFrame(df.apply(func, axis, *args, **kwargs)),
             new_index=new_index,
@@ -2432,17 +2458,29 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def _callable_func(self, func, axis, *args, **kwargs):
-        """Apply callable functions across given axis.
+        """
+        Apply passed function to each row/column.
 
-        Args:
-            func: The functions to apply.
-            axis: Target axis to apply the function along.
+        Parameters
+        ----------
+        func : callable
+            Function to apply.
+        axis : {0, 1}
+            Target axis to apply function along. 0 means apply to columns,
+            1 means apply to rows.
+        *args : args
+            Arguments to pass to the specified function.
+        **kwargs : kwargs
+            Arguments to pass to the specified function.
 
-        Returns:
-            A new PandasQueryCompiler.
+        Returns
+        -------
+        PandasQueryCompiler
+            New QueryCompiler containing the results of passed function
+            for each row/column.
         """
         func = wrap_udf_function(func)
-        new_modin_frame = self._modin_frame._apply_full_axis(
+        new_modin_frame = self._modin_frame.apply_full_axis(
             axis, lambda df: df.apply(func, axis=axis, *args, **kwargs)
         )
         return self.__constructor__(new_modin_frame)
@@ -2460,12 +2498,77 @@ class PandasQueryCompiler(BaseQueryCompiler):
     groupby_max = GroupbyReduceFunction.register("max")
     groupby_min = GroupbyReduceFunction.register("min")
     groupby_prod = GroupbyReduceFunction.register("prod")
-    groupby_size = GroupbyReduceFunction.register("size", method="size")
     groupby_sum = GroupbyReduceFunction.register("sum")
 
-    def _groupby_dict_reduce(
-        self, by, axis, agg_func, agg_args, agg_kwargs, groupby_kwargs, drop=False
+    def groupby_size(
+        self, by, axis, groupby_args, map_args, reduce_args, numeric_only, drop
     ):
+        result = self._groupby_dict_reduce(
+            by=by,
+            axis=axis,
+            agg_func={self.columns[0]: [("__size_col__", "size")]},
+            agg_args=[],
+            agg_kwargs={},
+            groupby_kwargs=groupby_args,
+            drop=drop,
+            method="size",
+            default_to_pandas_func=lambda grp: grp.size(),
+        )
+        if groupby_args.get("as_index", True):
+            result.columns = ["__reduced__"]
+        elif isinstance(result.columns, pandas.MultiIndex):
+            # Dropping one extra-level which was added because of renaming aggregation
+            result.columns = (
+                result.columns[:-1].droplevel(-1).append(pandas.Index(["size"]))
+            )
+        return result
+
+    def _groupby_dict_reduce(
+        self,
+        by,
+        axis,
+        agg_func,
+        agg_args,
+        agg_kwargs,
+        groupby_kwargs,
+        drop=False,
+        **kwargs,
+    ):
+        """
+        Group underlying data and apply aggregation functions to each group of the specified column/row.
+
+        This method is responsible of performing dictionary groupby aggregation for such functions,
+        that can be implemented via MapReduce approach.
+
+        Parameters
+        ----------
+        by : PandasQueryCompiler, column or index label, Grouper or list of such
+            Object that determine groups.
+        axis : {0, 1}
+            Axis to group and apply aggregation function along.
+            0 is for index, when 1 is for columns.
+        agg_func : dict(label) -> str
+            Dictionary that maps row/column labels to the function names.
+            **Note:** specified functions have to be supported by ``modin.data_management.functions.GroupbyReduceFunction``.
+            Supported functions are listed in the ``modin.data_management.functions.GroupbyReduceFunction.groupby_reduce_functions``
+            dictionary.
+        agg_args : list
+            Serves the compatibility purpose. Does not affect the result.
+        agg_kwargs : dict
+            Arguments to pass to the aggregation functions.
+        groupby_kwargs : dict
+            GroupBy parameters in the format of ``modin.pandas.DataFrame.groupby`` signature.
+        drop : bool, default: False
+            If `by` is a QueryCompiler indicates whether or not by-data came
+            from the `self`.
+        **kwargs : dict
+            Additional parameters to pass to the ``modin.data_management.functions.GroupbyReduceFunction.register``.
+
+        Returns
+        -------
+        PandasQueryCompiler
+            New QueryCompiler containing the result of groupby dictionary aggregation.
+        """
         map_dict = {}
         reduce_dict = {}
         rename_columns = any(
@@ -2497,7 +2600,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
                 )
                 reduce_dict[reduced_col_name] = groupby_reduce_functions[func][1]
             map_dict[col] = map_fns
-        return GroupbyReduceFunction.register(map_dict, reduce_dict)(
+        return GroupbyReduceFunction.register(map_dict, reduce_dict, **kwargs)(
             query_compiler=self,
             by=by,
             axis=axis,
@@ -2520,6 +2623,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         drop=False,
     ):
         def is_reduce_fn(fn, deep_level=0):
+            """Check whether all functions which is defined by `fn` can be implemented via MapReduce approach."""
             if not isinstance(fn, str) and isinstance(fn, Container):
                 # `deep_level` parameter specifies the number of nested containers that was met:
                 # - if it's 0, then we're outside of container, `fn` could be either function name
@@ -2578,6 +2682,26 @@ class PandasQueryCompiler(BaseQueryCompiler):
         not_broadcastable_by = [o for o in by if not isinstance(o, type(self))]
 
         def groupby_agg_builder(df, by=None, drop=False, partition_idx=None):
+            """
+            Compute groupby aggregation for a single partition.
+
+            Parameters
+            ----------
+            df : pandas.DataFrame
+                Partition of the self frame.
+            by : pandas.DataFrame, optional
+                Broadcasted partition which contains `by` columns.
+            drop : bool, default: False
+                Indicates whether `by` partition came from the `self` frame.
+            partition_idx : int, optional
+                Positional partition index along groupby axis.
+
+            Returns
+            -------
+            pandas.DataFrame
+                DataFrame containing the result of groupby aggregation
+                for this particular partition.
+            """
             # Set `as_index` to True to track the metadata of the grouping object
             # It is used to make sure that between phases we are constructing the
             # right index and placing columns in the correct order.
@@ -2599,7 +2723,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
                 )
                 internal_by_cols = internal_by_df.columns
 
-                external_by = by.columns.difference(internal_by)
+                external_by = by.columns.difference(internal_by).unique()
                 external_by_df = by[external_by].squeeze(axis=1)
 
                 if isinstance(external_by_df, pandas.DataFrame):
@@ -2615,6 +2739,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             by += not_broadcastable_by
 
             def compute_groupby(df, drop=False, partition_idx=0):
+                """Compute groupby aggregation for a single partition."""
                 grouped_df = df.groupby(by=by, axis=axis, **groupby_kwargs)
                 try:
                     if isinstance(agg_func, dict):
@@ -2749,6 +2874,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         from pandas.core.reshape.pivot import _convert_by
 
         def __convert_by(by):
+            """Convert passed value to a list."""
             if isinstance(by, pandas.Index):
                 by = list(by)
             by = _convert_by(by)
@@ -2781,7 +2907,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
             obj.index = index
 
         reindexed = self.__constructor__(
-            obj._modin_frame._apply_full_axis(
+            obj._modin_frame.apply_full_axis(
                 1,
                 lambda df: df.set_index(to_reindex, append=(len(to_reindex) == 1)),
                 new_columns=obj.columns.drop(to_reindex),
@@ -2805,6 +2931,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         dropna,
         margins_name,
         observed,
+        sort,
     ):
         ErrorMessage.missmatch_with_pandas(
             operation="pivot_table",
@@ -2814,6 +2941,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         from pandas.core.reshape.pivot import _convert_by
 
         def __convert_by(by):
+            """Convert passed value to a list."""
             if isinstance(by, pandas.Index):
                 return list(by)
             return _convert_by(by)
@@ -2831,6 +2959,22 @@ class PandasQueryCompiler(BaseQueryCompiler):
         keys_columns = self.getitem_column_array(unique_keys)
 
         def applyier(df, other):
+            """
+            Build pivot table for a single partition.
+
+            Parameters
+            ----------
+            df : pandas.DataFrame
+                Partition of the self frame.
+            other : pandas.DataFrame
+                Broadcasted partition that contains `value` columns
+                of the self frame.
+
+            Returns
+            -------
+            pandas.DataFrame
+                Pivot table for this particular partition.
+            """
             concated = pandas.concat([df, other], axis=1, copy=False)
             result = concated.pivot_table(
                 index=index,
@@ -2842,6 +2986,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
                 dropna=dropna,
                 margins_name=margins_name,
                 observed=observed,
+                sort=sort,
             )
 
             # in that case Pandas transposes the result of `pivot_table`,
@@ -2874,14 +3019,6 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     # Get_dummies
     def get_dummies(self, columns, **kwargs):
-        """Convert categorical variables to dummy variables for certain columns.
-
-        Args:
-            columns: The columns to convert.
-
-        Returns:
-            A new QueryCompiler.
-        """
         # `columns` as None does not mean all columns, by default it means only
         # non-numeric columns.
         if columns is None:
@@ -2897,14 +3034,14 @@ class PandasQueryCompiler(BaseQueryCompiler):
         # efficient if we are mapping over all of the data to do it this way
         # than it would be to reuse the code for specific columns.
         if len(columns) == len(self.columns):
-            new_modin_frame = self._modin_frame._apply_full_axis(
+            new_modin_frame = self._modin_frame.apply_full_axis(
                 0, lambda df: pandas.get_dummies(df, **kwargs), new_index=self.index
             )
             untouched_frame = None
         else:
             new_modin_frame = self._modin_frame.mask(
                 col_indices=columns
-            )._apply_full_axis(
+            ).apply_full_axis(
                 0, lambda df: pandas.get_dummies(df, **kwargs), new_index=self.index
             )
             untouched_frame = self.drop(columns=columns)
@@ -2912,7 +3049,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         # prepend the `new_modin_frame` with the raw data from the columns that were
         # not selected.
         if len(columns) != len(self.columns):
-            new_modin_frame = untouched_frame._modin_frame._concat(
+            new_modin_frame = untouched_frame._modin_frame.concat(
                 1, [new_modin_frame], how="left", sort=False
             )
         return self.__constructor__(new_modin_frame)
@@ -2927,11 +3064,32 @@ class PandasQueryCompiler(BaseQueryCompiler):
 
     def write_items(self, row_numeric_index, col_numeric_index, broadcasted_items):
         def iloc_mut(partition, row_internal_indices, col_internal_indices, item):
+            """
+            Write `value` in a specified location in a single partition.
+
+            Parameters
+            ----------
+            partition : pandas.DataFrame
+                Partition of the self frame.
+            row_internal_indices : list of ints
+                Positional indices of rows in this particular partition
+                to write `item` to.
+            col_internal_indices : list of ints
+                Positional indices of columns in this particular partition
+                to write `item` to.
+            item : 2D-array
+                Value to write.
+
+            Returns
+            -------
+            pandas.DataFrame
+                Partition data with updated values.
+            """
             partition = partition.copy()
             partition.iloc[row_internal_indices, col_internal_indices] = item
             return partition
 
-        new_modin_frame = self._modin_frame._apply_select_indices(
+        new_modin_frame = self._modin_frame.apply_select_indices(
             axis=None,
             func=iloc_mut,
             row_indices=row_numeric_index,
@@ -2944,22 +3102,8 @@ class PandasQueryCompiler(BaseQueryCompiler):
         return self.__constructor__(new_modin_frame)
 
     def sort_rows_by_column_values(self, columns, ascending=True, **kwargs):
-        """Reorder the rows based on the lexicographic order of the given columns.
-
-        Parameters
-        ----------
-        columns : scalar or list of scalar
-            The column or columns to sort by
-        ascending : bool
-            Sort in ascending order (True) or descending order (False)
-
-        Returns
-        -------
-        PandasQueryCompiler
-            A new query compiler that contains result of the sort
-        """
-        na_position = kwargs.get("na_position", "last")
-        kind = kwargs.get("kind", "quicksort")
+        ignore_index = kwargs.get("ignore_index", False)
+        kwargs["ignore_index"] = False
         if not is_list_like(columns):
             columns = [columns]
         # Currently, sort_values will just reindex based on the sorted values.
@@ -2969,49 +3113,33 @@ class PandasQueryCompiler(BaseQueryCompiler):
             col: self.getitem_column_array([col]).to_pandas().squeeze(axis=1)
             for col in columns
         }
+        # Clear index level names because they also appear in broadcast_value_dict
+        orig_index_level_names = self.index.names
+        tmp_index = self.index.copy()
+        tmp_index.names = [None] * tmp_index.nlevels
         # Index may contain duplicates
-        broadcast_values1 = pandas.DataFrame(broadcast_value_dict, index=self.index)
+        broadcast_values1 = pandas.DataFrame(broadcast_value_dict, index=tmp_index)
         # Index without duplicates
         broadcast_values2 = pandas.DataFrame(broadcast_value_dict)
         broadcast_values2 = broadcast_values2.reset_index(drop=True)
         # Index may contain duplicates
         new_index1 = broadcast_values1.sort_values(
-            by=columns,
-            axis=0,
-            ascending=ascending,
-            kind=kind,
-            na_position=na_position,
+            by=columns, axis=0, ascending=ascending, **kwargs
         ).index
         # Index without duplicates
         new_index2 = broadcast_values2.sort_values(
-            by=columns,
-            axis=0,
-            ascending=ascending,
-            kind=kind,
-            na_position=na_position,
+            by=columns, axis=0, ascending=ascending, **kwargs
         ).index
 
         result = self.reset_index(drop=True).reindex(axis=0, labels=new_index2)
-        result.index = new_index1
+        if ignore_index:
+            result = result.reset_index(drop=True)
+        else:
+            result.index = new_index1
+            result.index.names = orig_index_level_names
         return result
 
     def sort_columns_by_row_values(self, rows, ascending=True, **kwargs):
-        """Reorder the columns based on the lexicographic order of the given rows.
-
-        Parameters
-        ----------
-        rows : scalar or list of scalar
-            The row or rows to sort by
-        ascending : bool
-            Sort in ascending order (True) or descending order (False)
-
-        Returns
-        -------
-        PandasQueryCompiler
-            A new query compiler that contains result of the sort
-        """
-        na_position = kwargs.get("na_position", "last")
-        kind = kwargs.get("kind", "quicksort")
         if not is_list_like(rows):
             rows = [rows]
         ErrorMessage.default_to_pandas("sort_values")
@@ -3024,11 +3152,7 @@ class PandasQueryCompiler(BaseQueryCompiler):
         )
         broadcast_values.columns = self.columns
         new_columns = broadcast_values.sort_values(
-            by=rows,
-            axis=1,
-            ascending=ascending,
-            kind=kind,
-            na_position=na_position,
+            by=rows, axis=1, ascending=ascending, **kwargs
         ).columns
         return self.reindex(axis=1, labels=new_columns)
 

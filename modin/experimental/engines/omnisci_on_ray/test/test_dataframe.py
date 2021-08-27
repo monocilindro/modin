@@ -16,8 +16,10 @@ import pandas
 import numpy as np
 import pyarrow
 import pytest
+import re
 
 from modin.config import IsExperimental, Engine, Backend
+from modin.pandas.test.utils import io_ops_bad_exc
 
 IsExperimental.put(True)
 Engine.put("ray")
@@ -33,6 +35,10 @@ from modin.pandas.test.utils import (
     generate_multiindex,
     eval_general,
     eval_io,
+)
+
+from modin.experimental.engines.omnisci_on_ray.frame.partition_manager import (
+    OmnisciOnRayFramePartitionManager,
 )
 
 
@@ -52,7 +58,7 @@ def run_and_compare(
     force_lazy=True,
     force_arrow_execute=False,
     allow_subqueries=False,
-    **kwargs
+    **kwargs,
 ):
     def run_modin(
         fn,
@@ -62,7 +68,7 @@ def run_and_compare(
         force_arrow_execute,
         allow_subqueries,
         constructor_kwargs,
-        **kwargs
+        **kwargs,
     ):
         kwargs["df1"] = pd.DataFrame(data, **constructor_kwargs)
         kwargs["df2"] = pd.DataFrame(data2, **constructor_kwargs)
@@ -100,7 +106,7 @@ def run_and_compare(
                 force_arrow_execute=force_arrow_execute,
                 allow_subqueries=allow_subqueries,
                 constructor_kwargs=constructor_kwargs,
-                **kwargs
+                **kwargs,
             )
             _ = exp_res.index
     else:
@@ -112,7 +118,7 @@ def run_and_compare(
             force_arrow_execute=force_arrow_execute,
             allow_subqueries=allow_subqueries,
             constructor_kwargs=constructor_kwargs,
-            **kwargs
+            **kwargs,
         )
         df_equals(ref_res, exp_res)
 
@@ -157,7 +163,7 @@ class TestCSV:
     }
 
     def test_usecols_csv(self):
-        """ check with the following arguments: names, dtype, skiprows, delimiter """
+        """check with the following arguments: names, dtype, skiprows, delimiter"""
         csv_file = os.path.join(self.root, "modin/pandas/test/data", "test_usecols.csv")
 
         for kwargs in (
@@ -312,20 +318,40 @@ class TestCSV:
             True,
             False,
             ["col2"],
+            ["c2"],
+            [["col2", "col3"]],
+            {"col23": ["col2", "col3"]},
         ],
     )
+    @pytest.mark.parametrize("names", [None, [f"c{x}" for x in range(1, 7)]])
     def test_read_csv_datetime(
         self,
         engine,
         parse_dates,
+        names,
     ):
+
+        parse_dates_unsupported = isinstance(parse_dates, dict) or (
+            isinstance(parse_dates, list) and isinstance(parse_dates[0], list)
+        )
+        if parse_dates_unsupported and engine == "arrow" and not names:
+            pytest.skip(
+                "In these cases Modin raises `ArrowEngineException` while pandas "
+                "doesn't raise any exceptions that causes tests fails"
+            )
+        # In these cases Modin raises `ArrowEngineException` while pandas
+        # raises `ValueError`, so skipping exception type checking
+        skip_exc_type_check = parse_dates_unsupported and engine == "arrow"
 
         eval_io(
             fn_name="read_csv",
             md_extra_kwargs={"engine": engine},
+            check_exception_type=not skip_exc_type_check,
+            raising_exceptions=None if skip_exc_type_check else io_ops_bad_exc,
             # read_csv kwargs
             filepath_or_buffer=pytest.csvs_names["test_read_csv_regular"],
             parse_dates=parse_dates,
+            names=names,
         )
 
     @pytest.mark.parametrize("engine", [None, "arrow"])
@@ -458,6 +484,34 @@ class TestMultiIndex:
 
         eval_general(pd, pandas, applier)
 
+    @pytest.mark.parametrize("is_multiindex", [True, False])
+    @pytest.mark.parametrize(
+        "column_names", [None, ["level1", None], ["level1", "level2"]]
+    )
+    def test_reset_index_multicolumns(self, is_multiindex, column_names):
+        index = (
+            pandas.MultiIndex.from_tuples(
+                [(i, j, k) for i in range(2) for j in range(3) for k in range(4)],
+                names=["l1", "l2", "l3"],
+            )
+            if is_multiindex
+            else pandas.Index(np.arange(len(self.data["a"])), name="index")
+        )
+        columns = pandas.MultiIndex.from_tuples(
+            [("a", "b"), ("b", "c")], names=column_names
+        )
+        data = np.array(list(self.data.values())).T
+
+        def applier(df, **kwargs):
+            df = df + 1
+            return df.reset_index(drop=False)
+
+        run_and_compare(
+            fn=applier,
+            data=data,
+            constructor_kwargs={"index": index, "columns": columns},
+        )
+
     def test_set_index_name(self):
         index = pandas.Index.__new__(pandas.Index, data=[i for i in range(24)])
 
@@ -515,6 +569,11 @@ class TestConcat:
         "c": [400, 500, 600],
         "b": [40, 50, 60],
         "f": [444, 555, 666],
+    }
+    data3 = {
+        "f": [2, 3, 4],
+        "g": [400, 500, 600],
+        "h": [20, 30, 40],
     }
 
     @pytest.mark.parametrize("join", ["inner", "outer"])
@@ -631,12 +690,64 @@ class TestConcat:
             data=self.data,
         )
 
+    @pytest.mark.parametrize("join", ["inner"])
+    @pytest.mark.parametrize("sort", bool_arg_values)
+    @pytest.mark.parametrize("ignore_index", bool_arg_values)
+    def test_concat_join(self, join, sort, ignore_index):
+        def concat(lib, df1, df2, join, sort, ignore_index, **kwargs):
+            return lib.concat(
+                [df1, df2], axis=1, join=join, sort=sort, ignore_index=ignore_index
+            )
+
+        run_and_compare(
+            concat,
+            data=self.data,
+            data2=self.data3,
+            join=join,
+            sort=sort,
+            ignore_index=ignore_index,
+        )
+
+    def test_concat_index_name(self):
+        df1 = pandas.DataFrame(self.data)
+        df1 = df1.set_index("a")
+        df2 = pandas.DataFrame(self.data3)
+        df2 = df2.set_index("f")
+
+        ref = pandas.concat([df1, df2], axis=1, join="inner")
+        exp = pd.concat([df1, df2], axis=1, join="inner")
+
+        df_equals(ref, exp)
+
+        df2.index.name = "a"
+        ref = pandas.concat([df1, df2], axis=1, join="inner")
+        exp = pd.concat([df1, df2], axis=1, join="inner")
+
+        df_equals(ref, exp)
+
+    def test_concat_index_names(self):
+        df1 = pandas.DataFrame(self.data)
+        df1 = df1.set_index(["a", "b"])
+        df2 = pandas.DataFrame(self.data3)
+        df2 = df2.set_index(["f", "h"])
+
+        ref = pandas.concat([df1, df2], axis=1, join="inner")
+        exp = pd.concat([df1, df2], axis=1, join="inner")
+
+        df_equals(ref, exp)
+
+        df2.index.names = ["a", "b"]
+        ref = pandas.concat([df1, df2], axis=1, join="inner")
+        exp = pd.concat([df1, df2], axis=1, join="inner")
+
+        df_equals(ref, exp)
+
 
 class TestGroupby:
     data = {
-        "a": [1, 1, 2, 2, 2],
-        "b": [11, 21, 12, 22, 32],
-        "c": [101, 201, 102, 202, 302],
+        "a": [1, 1, 2, 2, 2, 1],
+        "b": [11, 21, 12, 22, 32, 11],
+        "c": [101, 201, 202, 202, 302, 302],
     }
     cols_value = ["a", ["a", "b"]]
 
@@ -677,17 +788,23 @@ class TestGroupby:
             groupby_sum, data=self.data, cols=cols, as_index=as_index, force_lazy=False
         )
 
-    def test_groupby_agg_count(self):
-        def groupby(df, **kwargs):
-            return df.groupby("a").agg({"b": "count"})
+    @pytest.mark.parametrize("agg", ["count", "size", "nunique"])
+    def test_groupby_agg(self, agg):
+        def groupby(df, agg, **kwargs):
+            return df.groupby("a").agg({"b": agg})
 
-        run_and_compare(groupby, data=self.data)
+        run_and_compare(groupby, data=self.data, agg=agg)
 
-    def test_groupby_agg_size(self):
-        def groupby(df, **kwargs):
-            return df.groupby("a").agg({"b": "size"})
+    def test_groupby_agg_default_to_pandas(self):
+        def lambda_func(df, **kwargs):
+            return df.groupby("a").agg(lambda df: (df.mean() - df.sum()) // 2)
 
-        run_and_compare(groupby, data=self.data)
+        run_and_compare(lambda_func, data=self.data, force_lazy=False)
+
+        def not_implemented_func(df, **kwargs):
+            return df.groupby("a").agg("cumprod")
+
+        run_and_compare(lambda_func, data=self.data, force_lazy=False)
 
     @pytest.mark.xfail(
         reason="Function specified as a string should be passed into backend API, but currently it is transformed into a lambda"
@@ -709,6 +826,50 @@ class TestGroupby:
 
         run_and_compare(groupby, data=self.data, constructor_kwargs={"index": index})
 
+    def test_groupby_lazy_squeeze(self):
+        def applier(df, **kwargs):
+            return df.groupby("a").sum().squeeze(axis=1)
+
+        run_and_compare(
+            applier,
+            data=self.data,
+            constructor_kwargs={"columns": ["a", "b"]},
+            force_lazy=True,
+        )
+
+    @pytest.mark.parametrize("method", ["sum", "size"])
+    def test_groupby_series(self, method):
+        def groupby(df, **kwargs):
+            ser = df[df.columns[0]]
+            return getattr(ser.groupby(ser), method)()
+
+        run_and_compare(groupby, data=self.data)
+
+    def test_groupby_size(self):
+        def groupby(df, **kwargs):
+            return df.groupby("a").size()
+
+        run_and_compare(groupby, data=self.data)
+
+    @pytest.mark.parametrize("by", [["a"], ["a", "b", "c"]])
+    @pytest.mark.parametrize("agg", ["sum", "size"])
+    @pytest.mark.parametrize("as_index", [True, False])
+    def test_groupby_agg_by_col(self, by, agg, as_index):
+        def simple_agg(df, **kwargs):
+            return df.groupby(by, as_index=as_index).agg(agg)
+
+        run_and_compare(simple_agg, data=self.data)
+
+        def dict_agg(df, **kwargs):
+            return df.groupby(by, as_index=as_index).agg({by[0]: agg})
+
+        run_and_compare(dict_agg, data=self.data)
+
+        def dict_agg_all_cols(df, **kwargs):
+            return df.groupby(by, as_index=as_index).agg({col: agg for col in by})
+
+        run_and_compare(dict_agg_all_cols, data=self.data)
+
     taxi_data = {
         "a": [1, 1, 2, 2],
         "b": [11, 21, 12, 11],
@@ -724,11 +885,7 @@ class TestGroupby:
     #       res = df.groupby("cab_type").size() - this should be tested later as well
     def test_taxi_q1(self):
         def taxi_q1(df, **kwargs):
-            # TODO: For now we can't do such groupby by first column since modin use that
-            #      column as aggregation one by default. We don't support such cases at
-            #      at the moment, this will be handled later
-            # ref = df.groupby("a").size()
-            return df.groupby("b").size()
+            return df.groupby("a").size()
 
         run_and_compare(taxi_q1, data=self.taxi_data)
 
@@ -991,6 +1148,7 @@ class TestAgg:
         "c": [None, 200, None, 400, 500, 600],
         "d": [11, 22, 33, 22, 33, 22],
     }
+    int_data = pandas.DataFrame(data).fillna(0).astype("int").to_dict()
 
     @pytest.mark.parametrize("agg", ["max", "min", "sum", "mean"])
     @pytest.mark.parametrize("skipna", bool_arg_values)
@@ -1023,35 +1181,69 @@ class TestAgg:
             ascending=ascending,
         )
 
+    @pytest.mark.parametrize(
+        "method", ["sum", "mean", "max", "min", "count", "nunique"]
+    )
+    def test_simple_agg_no_default(self, method):
+        def applier(df, **kwargs):
+            if isinstance(df, pd.DataFrame):
+                # At the end of reduction function it does inevitable `transpose`, which
+                # is defaulting to pandas. The following logic check that `transpose` is the only
+                # function that falling back to pandas in the reduction operation flow.
+                with pytest.warns(UserWarning) as warns:
+                    res = getattr(df, method)()
+                assert (
+                    len(warns) == 1
+                ), f"More than one warning were arisen: len(warns) != 1 ({len(warns)} != 1)"
+                message = warns[0].message.args[0]
+                assert (
+                    re.match(r".*transpose.*defaulting to pandas", message) is not None
+                ), f"Expected DataFrame.transpose defaulting to pandas warning, got: {message}"
+            else:
+                res = getattr(df, method)()
+            return res
+
+        run_and_compare(applier, data=self.data, force_lazy=False)
+
+    @pytest.mark.parametrize("data", [data, int_data])
+    @pytest.mark.parametrize("dropna", bool_arg_values)
+    def test_nunique(self, data, dropna):
+        def applier(df, **kwargs):
+            return df.nunique(dropna=dropna)
+
+        run_and_compare(applier, data=data, force_lazy=False)
+
 
 class TestMerge:
     data = {
-        "a": [1, 2, 3],
-        "b": [10, 20, 30],
-        "e": [11, 22, 33],
+        "a": [1, 2, 3, 6, 5, 4],
+        "b": [10, 20, 30, 60, 50, 40],
+        "e": [11, 22, 33, 66, 55, 44],
     }
     data2 = {
-        "a": [4, 2, 3],
-        "b": [40, 20, 30],
-        "d": [4000, 2000, 3000],
+        "a": [4, 2, 3, 7, 1, 5],
+        "b": [40, 20, 30, 70, 10, 50],
+        "d": [4000, 2000, 3000, 7000, 1000, 5000],
     }
-    on_values = ["a", ["a"], ["a", "b"], ["b", "a"]]
+    on_values = ["a", ["a"], ["a", "b"], ["b", "a"], None]
     how_values = ["inner", "left"]
 
     @pytest.mark.parametrize("on", on_values)
     @pytest.mark.parametrize("how", how_values)
-    def test_merge(self, on, how):
-        def merge(lib, df1, df2, on, how):
-            return df1.merge(df2, on=on, how=how)
+    @pytest.mark.parametrize("sort", [True, False])
+    def test_merge(self, on, how, sort):
+        def merge(lib, df1, df2, on, how, sort, **kwargs):
+            return df1.merge(df2, on=on, how=how, sort=sort)
 
-        run_and_compare(merge, data=self.data, data2=self.data2, on=on, how=how)
+        run_and_compare(
+            merge, data=self.data, data2=self.data2, on=on, how=how, sort=sort
+        )
 
-    @pytest.mark.parametrize("how", how_values)
-    def test_default_merge(self, how):
-        def default_merge(lib, df1, df2, how):
-            return df1.merge(df2, how=how)
+    def test_merge_non_str_column_name(self):
+        def merge(lib, df1, df2, on, **kwargs):
+            return df1.merge(df2, on=on, how="inner")
 
-        run_and_compare(default_merge, data=self.data, data2=self.data2, how=how)
+        run_and_compare(merge, data=[[1, 2], [3, 4]], data2=[[1, 2], [3, 4]], on=1)
 
     h2o_data = {
         "id1": ["id1", "id10", "id100", "id1000"],
@@ -1222,6 +1414,34 @@ class TestMerge:
             return res
 
         run_and_compare(merge, data=self.dt_data1, data2=self.dt_data2)
+
+    left_data = {"a": [1, 2, 3, 4], "b": [10, 20, 30, 40], "c": [11, 12, 13, 14]}
+    right_data = {"c": [1, 2, 3, 4], "b": [10, 20, 30, 40], "d": [100, 200, 300, 400]}
+
+    @pytest.mark.parametrize("how", how_values)
+    @pytest.mark.parametrize(
+        "left_on, right_on", [["a", "c"], [["a", "b"], ["c", "b"]]]
+    )
+    def test_merge_left_right_on(self, how, left_on, right_on):
+        def merge(df1, df2, how, left_on, right_on, **kwargs):
+            return df1.merge(df2, how=how, left_on=left_on, right_on=right_on)
+
+        run_and_compare(
+            merge,
+            data=self.left_data,
+            data2=self.right_data,
+            how=how,
+            left_on=left_on,
+            right_on=right_on,
+        )
+        run_and_compare(
+            merge,
+            data=self.right_data,
+            data2=self.left_data,
+            how=how,
+            left_on=right_on,
+            right_on=left_on,
+        )
 
 
 class TestBinaryOp:
@@ -1707,6 +1927,68 @@ class TestDropna:
             return df.groupby(by=by, dropna=dropna).sum().fillna(0)
 
         run_and_compare(applier, data=self.data)
+
+
+class TestUnsupportedColumns:
+    @pytest.mark.parametrize(
+        "data,is_good",
+        [
+            [["1", "2", None, "2", "1"], True],
+            [[None, "3", None, "2", "1"], True],
+            [[1, "2", None, "2", "1"], False],
+            [[None, 3, None, "2", "1"], False],
+        ],
+    )
+    def test_unsupported_columns(self, data, is_good):
+        pandas_df = pandas.DataFrame({"col": data})
+        obj, bad_cols = OmnisciOnRayFramePartitionManager._get_unsupported_cols(
+            pandas_df
+        )
+        if is_good:
+            assert obj and not bad_cols
+        else:
+            assert not obj and bad_cols == ["col"]
+
+
+class TestConstructor:
+    @pytest.mark.parametrize(
+        "index",
+        [
+            None,
+            pandas.Index([1, 2, 3]),
+            pandas.MultiIndex.from_tuples([(1, 1), (2, 2), (3, 3)]),
+        ],
+    )
+    def test_shape_hint_detection(self, index):
+        df = pd.DataFrame({"a": [1, 2, 3]}, index=index)
+        assert df._query_compiler._shape_hint == "column"
+
+        transposed_data = df._to_pandas().T.to_dict()
+        df = pd.DataFrame(transposed_data)
+        assert df._query_compiler._shape_hint == "row"
+
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]}, index=index)
+        assert df._query_compiler._shape_hint is None
+
+        df = pd.DataFrame({"a": [1]}, index=None if index is None else index[:1])
+        assert df._query_compiler._shape_hint == "column"
+
+    def test_shape_hint_detection_from_arrow(self):
+        at = pyarrow.Table.from_pydict({"a": [1, 2, 3]})
+        df = pd.utils.from_arrow(at)
+        assert df._query_compiler._shape_hint == "column"
+
+        at = pyarrow.Table.from_pydict({"a": [1], "b": [2], "c": [3]})
+        df = pd.utils.from_arrow(at)
+        assert df._query_compiler._shape_hint == "row"
+
+        at = pyarrow.Table.from_pydict({"a": [1, 2, 3], "b": [1, 2, 3]})
+        df = pd.utils.from_arrow(at)
+        assert df._query_compiler._shape_hint is None
+
+        at = pyarrow.Table.from_pydict({"a": [1]})
+        df = pd.utils.from_arrow(at)
+        assert df._query_compiler._shape_hint == "column"
 
 
 if __name__ == "__main__":

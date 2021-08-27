@@ -342,8 +342,6 @@ def test_simple_row_groupby(by, as_index, col1_category):
         is_default=True,
     )
 
-    # Workaround for Pandas bug #34656. Recreate groupby object for Pandas
-    pandas_groupby = pandas_df.groupby(by=pandas_by, as_index=as_index)
     apply_functions = [
         lambda df: df.sum(),
         lambda df: pandas.Series([1, 2, 3, 4], name="result"),
@@ -914,6 +912,7 @@ def test_series_groupby(by, as_index_series_or_dataframe):
         eval_max(modin_groupby, pandas_groupby)
         eval_len(modin_groupby, pandas_groupby)
         eval_sum(modin_groupby, pandas_groupby)
+        eval_size(modin_groupby, pandas_groupby)
         eval_ngroup(modin_groupby, pandas_groupby)
         eval_nunique(modin_groupby, pandas_groupby)
         eval_median(modin_groupby, pandas_groupby)
@@ -1593,8 +1592,8 @@ def test_not_str_by(by, as_index):
     )
 
     modin_groupby_equals_pandas(md_grp, pd_grp)
-    df_equals(md_grp.sum(), pd_grp.sum())
-    df_equals(md_grp.size(), pd_grp.size())
-    df_equals(md_grp.agg(lambda df: df.mean()), pd_grp.agg(lambda df: df.mean()))
-    df_equals(md_grp.dtypes, pd_grp.dtypes)
-    df_equals(md_grp.first(), pd_grp.first())
+    eval_general(md_grp, pd_grp, lambda grp: grp.sum())
+    eval_general(md_grp, pd_grp, lambda grp: grp.size())
+    eval_general(md_grp, pd_grp, lambda grp: grp.agg(lambda df: df.mean()))
+    eval_general(md_grp, pd_grp, lambda grp: grp.dtypes)
+    eval_general(md_grp, pd_grp, lambda grp: grp.first())

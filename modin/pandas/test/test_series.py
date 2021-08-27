@@ -19,6 +19,7 @@ import matplotlib
 import modin.pandas as pd
 from numpy.testing import assert_array_equal
 from pandas.core.base import SpecificationError
+from modin.utils import get_current_backend
 import sys
 
 from modin.utils import to_pandas
@@ -486,16 +487,7 @@ def test___pow__(data):
 )
 @pytest.mark.parametrize(
     "data",
-    [
-        *test_data_values,
-        pytest.param(
-            "empty",
-            marks=pytest.mark.xfail_backends(
-                ["BaseOnPython"],
-                reason="Empty Series has a missmatched from Pandas dtype.",
-            ),
-        ),
-    ],
+    [*test_data_values, "empty"],
     ids=[*test_data_keys, "empty"],
 )
 def test___repr__(name, dt_index, data):
@@ -509,7 +501,14 @@ def test___repr__(name, dt_index, data):
             "1/1/2000", periods=len(pandas_series.index), freq="T"
         )
         pandas_series.index = modin_series.index = index
-    assert repr(modin_series) == repr(pandas_series)
+
+    if get_current_backend() == "BaseOnPython" and data == "empty":
+        # TODO: Remove this when default `dtype` of empty Series will be `object` in pandas (see #3142).
+        assert modin_series.dtype == np.object
+        assert pandas_series.dtype == np.float64
+        df_equals(modin_series.index, pandas_series.index)
+    else:
+        assert repr(modin_series) == repr(pandas_series)
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
@@ -723,13 +722,27 @@ def test_aggregate_numeric_except(request, data, func):
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
 def test_aggregate_error_checking(data):
-    modin_series, _ = create_test_series(data)  # noqa: F841
+    modin_series, pandas_series = create_test_series(data)
 
+    assert pandas_series.aggregate("ndim") == 1
     assert modin_series.aggregate("ndim") == 1
-    with pytest.warns(UserWarning):
-        modin_series.aggregate("cumproduct")
-    with pytest.raises(ValueError):
-        modin_series.aggregate("NOT_EXISTS")
+
+    def user_warning_checker(series, fn):
+        if isinstance(series, pd.Series):
+            with pytest.warns(UserWarning):
+                return fn(series)
+        return fn(series)
+
+    eval_general(
+        modin_series,
+        pandas_series,
+        lambda series: user_warning_checker(
+            series, fn=lambda series: series.aggregate("cumproduct")
+        ),
+    )
+    eval_general(
+        modin_series, pandas_series, lambda series: series.aggregate("NOT_EXISTS")
+    )
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
@@ -1533,12 +1546,14 @@ def test_dropna_inplace(data):
     df_equals(modin_series, pandas_series)
 
 
-@pytest.mark.xfail_backends(
-    ["BaseOnPython"], reason="Empty Series has a missmatched from Pandas dtype."
-)
 def test_dtype_empty():
     modin_series, pandas_series = pd.Series(), pandas.Series()
-    assert modin_series.dtype == pandas_series.dtype
+    if get_current_backend() == "BaseOnPython":
+        # TODO: Remove this when default `dtype` of empty Series will be `object` in pandas (see #3142).
+        assert modin_series.dtype == np.object
+        assert pandas_series.dtype == np.float64
+    else:
+        assert modin_series.dtype == pandas_series.dtype
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
@@ -1714,12 +1729,47 @@ def test_ffill(data):
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
-def test_fillna(data):
+@pytest.mark.parametrize("reindex", [None, 2, -2])
+@pytest.mark.parametrize("limit", [None, 1, 2, 0.5, -1, -2, 1.5])
+def test_fillna(data, reindex, limit):
     modin_series, pandas_series = create_test_series(data)
-    df_equals(modin_series.fillna(0), pandas_series.fillna(0))
-    df_equals(modin_series.fillna(method="bfill"), pandas_series.fillna(method="bfill"))
-    df_equals(modin_series.fillna(method="ffill"), pandas_series.fillna(method="ffill"))
-    df_equals(modin_series.fillna(0, limit=1), pandas_series.fillna(0, limit=1))
+    index = pandas_series.index
+    pandas_replace_series = index.to_series().sample(frac=1)
+    modin_replace_series = pd.Series(pandas_replace_series)
+    replace_dict = pandas_replace_series.to_dict()
+
+    if reindex is not None:
+        if reindex > 0:
+            pandas_series = pandas_series[:reindex].reindex(index)
+            modin_series = pd.Series(pandas_series)
+        else:
+            pandas_series = pandas_series[reindex:].reindex(index)
+        # Because of bug #3178 modin Series has to be created from pandas
+        # Series instead of performing the same slice and reindex operations.
+        modin_series = pd.Series(pandas_series)
+
+    if isinstance(limit, float):
+        limit = int(len(modin_series) * limit)
+    if limit is not None and limit < 0:
+        limit = len(modin_series) + limit
+
+    df_equals(modin_series.fillna(0, limit=limit), pandas_series.fillna(0, limit=limit))
+    df_equals(
+        modin_series.fillna(method="bfill", limit=limit),
+        pandas_series.fillna(method="bfill", limit=limit),
+    )
+    df_equals(
+        modin_series.fillna(method="ffill", limit=limit),
+        pandas_series.fillna(method="ffill", limit=limit),
+    )
+    df_equals(
+        modin_series.fillna(modin_replace_series, limit=limit),
+        pandas_series.fillna(pandas_replace_series, limit=limit),
+    )
+    df_equals(
+        modin_series.fillna(replace_dict, limit=limit),
+        pandas_series.fillna(replace_dict, limit=limit),
+    )
 
 
 @pytest.mark.xfail(reason="Using pandas Series.")
@@ -2343,12 +2393,7 @@ def test_prod(axis, skipna):
 
 
 @pytest.mark.parametrize(
-    "numeric_only",
-    [
-        None,
-        False,
-        pytest.param(True, marks=pytest.mark.xfail(reason="didn't raise Exception")),
-    ],
+    "numeric_only", bool_arg_values, ids=arg_keys("numeric_only", bool_arg_keys)
 )
 @pytest.mark.parametrize(
     "min_count", int_arg_values, ids=arg_keys("min_count", int_arg_keys)
@@ -2872,16 +2917,6 @@ def test_shape(data):
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
-def test_shift(data):
-    modin_series, pandas_series = create_test_series(data)
-    df_equals(modin_series.shift(), pandas_series.shift())
-    df_equals(modin_series.shift(fill_value=777), pandas_series.shift(fill_value=777))
-    df_equals(modin_series.shift(periods=7), pandas_series.shift(periods=7))
-    df_equals(modin_series.shift(periods=-3), pandas_series.shift(periods=-3))
-    eval_general(modin_series, pandas_series, lambda df: df.shift(axis=1))
-
-
-@pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
 def test_size(data):
     modin_series, pandas_series = create_test_series(data)
     assert modin_series.size == pandas_series.size
@@ -2897,18 +2932,29 @@ def test_skew(data, skipna):
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
-@pytest.mark.parametrize("index", ["default", "ndarray"])
+@pytest.mark.parametrize("index", ["default", "ndarray", "has_duplicates"])
 @pytest.mark.parametrize("periods", [0, 1, -1, 10, -10, 1000000000, -1000000000])
-def test_slice_shift(data, index, periods):
-    if index == "default":
-        modin_series, pandas_series = create_test_series(data)
-    elif index == "ndarray":
-        modin_series, pandas_series = create_test_series(data)
+def test_shift_slice_shift(data, index, periods):
+    modin_series, pandas_series = create_test_series(data)
+    if index == "ndarray":
         data_column_length = len(data[next(iter(data))])
-        index_data = np.arange(2, data_column_length + 2)
-        modin_series.index = index_data
-        pandas_series.index = index_data
+        modin_series.index = pandas_series.index = np.arange(2, data_column_length + 2)
+    elif index == "has_duplicates":
+        modin_series.index = pandas_series.index = list(modin_series.index[:-3]) + [
+            0,
+            1,
+            2,
+        ]
 
+    df_equals(
+        modin_series.shift(periods=periods),
+        pandas_series.shift(periods=periods),
+    )
+    df_equals(
+        modin_series.shift(periods=periods, fill_value=777),
+        pandas_series.shift(periods=periods, fill_value=777),
+    )
+    eval_general(modin_series, pandas_series, lambda df: df.shift(axis=1))
     df_equals(
         modin_series.slice_shift(periods=periods),
         pandas_series.slice_shift(periods=periods),
@@ -3032,7 +3078,9 @@ def test_subtract(data):
 @pytest.mark.parametrize(
     "skipna", bool_arg_values, ids=arg_keys("skipna", bool_arg_keys)
 )
-@pytest.mark.parametrize("numeric_only", [None, False, True])
+@pytest.mark.parametrize(
+    "numeric_only", bool_arg_values, ids=arg_keys("numeric_only", bool_arg_keys)
+)
 @pytest.mark.parametrize(
     "min_count", int_arg_values, ids=arg_keys("min_count", int_arg_keys)
 )
@@ -3457,6 +3505,19 @@ def test_where():
     assert all(to_pandas(modin_result) == pandas_result)
 
 
+@pytest.mark.parametrize("data", test_string_data_values, ids=test_string_data_keys)
+@pytest.mark.parametrize(
+    "key",
+    [0, slice(0, len(test_string_data_values) / 2)],
+    ids=["single_key", "slice_key"],
+)
+def test_str___getitem__(data, key):
+    modin_series, pandas_series = create_test_series(data)
+    modin_result = modin_series.str[key]
+    pandas_result = pandas_series.str[key]
+    df_equals(modin_result, pandas_result)
+
+
 # Test str operations
 def test_str_cat():
     data = ["abC|DeF,Hik", "gSaf,qWer|Gre", "asd3,4sad|", np.NaN]
@@ -3606,43 +3667,31 @@ def test_str_contains(data, pat, case, na):
 @pytest.mark.parametrize("n", int_arg_values, ids=int_arg_keys)
 @pytest.mark.parametrize("case", bool_arg_values, ids=bool_arg_keys)
 def test_str_replace(data, pat, repl, n, case):
-    modin_series, pandas_series = create_test_series(data)
-
-    try:
-        pandas_result = pandas_series.str.replace(
-            pat, repl, n=n, case=case, regex=False
-        )
-    except Exception as e:
-        with pytest.raises(type(e)):
-            modin_series.str.replace(pat, repl, n=n, case=case, regex=False)
-    else:
-        modin_result = modin_series.str.replace(pat, repl, n=n, case=case, regex=False)
-        df_equals(modin_result, pandas_result)
-
+    eval_general(
+        *create_test_series(data),
+        lambda series: series.str.replace(pat, repl, n=n, case=case, regex=False),
+    )
     # Test regex
-    pat = ",|b"
-    try:
-        pandas_result = pandas_series.str.replace(pat, repl, n=n, case=case, regex=True)
-    except Exception as e:
-        with pytest.raises(type(e)):
-            modin_series.str.replace(pat, repl, n=n, case=case, regex=True)
-    else:
-        modin_result = modin_series.str.replace(pat, repl, n=n, case=case, regex=True)
-        df_equals(modin_result, pandas_result)
+    eval_general(
+        *create_test_series(data),
+        lambda series: series.str.replace(
+            pat=",|b", repl=repl, n=n, case=case, regex=True
+        ),
+    )
 
 
 @pytest.mark.parametrize("data", test_string_data_values, ids=test_string_data_keys)
 @pytest.mark.parametrize("repeats", int_arg_values, ids=int_arg_keys)
-def test_str_repeats(data, repeats):
+def test_str_repeat(data, repeats):
     modin_series, pandas_series = create_test_series(data)
 
     try:
-        pandas_result = pandas_series.str.repeats(repeats)
+        pandas_result = pandas_series.str.repeat(repeats)
     except Exception as e:
         with pytest.raises(type(e)):
-            modin_series.str.repeats(repeats)
+            modin_series.str.repeat(repeats)
     else:
-        modin_result = modin_series.str.repeats(repeats)
+        modin_result = modin_series.str.repeat(repeats)
         df_equals(modin_result, pandas_result)
 
 

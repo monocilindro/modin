@@ -11,6 +11,34 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+
+"""
+Module houses Modin parser classes, that are used for data parsing on the workers.
+
+Notes
+-----
+Data parsing mechanism differs depending on the data format type:
+
+* text format type (CSV, EXCEL, FWF, JSON):
+  File parsing begins from retrieving `start` and `end` parameters from `parse`
+  kwargs - these parameters define start and end bytes of data file, that should
+  be read in the concrete partition. Using this data and file handle got from
+  `fname`, binary data is read by python `read` function. Then resulting data is passed
+  into `pandas.read_*` function as `io.BytesIO` object to get corresponding
+  `pandas.DataFrame` (we need to do this because Modin partitions internally stores data
+  as `pandas.DataFrame`).
+
+* columnar store type (FEATHER, HDF, PARQUET):
+  In this case data chunk to be read is defined by columns names passed as `columns`
+  parameter as part of `parse` kwargs, so no additional action is needed and `fname`
+  and `kwargs` are just passed into `pandas.read_*` function (in some corner cases
+  `pyarrow.read_*` function can be used).
+
+* SQL type:
+  Chunking is incorporated in the `sql` parameter as part of query, so `parse`
+  parameters are passed into `pandas.read_sql` function without modification.
+"""
+
 from collections import OrderedDict
 from io import BytesIO
 import numpy as np
@@ -18,22 +46,56 @@ import pandas
 from pandas.core.dtypes.cast import find_common_type
 from pandas.core.dtypes.concat import union_categoricals
 from pandas.io.common import infer_compression
+from pandas.util._decorators import doc
 import warnings
 
 from modin.engines.base.io import FileDispatcher
 from modin.data_management.utils import split_result_of_axis_func_pandas
 from modin.error_message import ErrorMessage
 
+_doc_pandas_parser_class = """
+Class for handling {data_type} on the workers using pandas backend.
+
+Inherits common functions from `PandasParser` class.
+"""
+
+_doc_parse_func = """
+Parse data on the workers.
+
+Parameters
+----------
+{parameters}
+**kwargs : dict
+    Keywords arguments to be used by `parse` function or
+    passed into `read_*` function.
+
+Returns
+-------
+list
+    List with splitted parse results and it's metadata
+    (index, dtypes, etc.).
+"""
+
+_doc_parse_parameters_common = """fname : str or path object
+    Name of the file or path to read."""
+
 
 def _split_result_for_readers(axis, num_splits, df):  # pragma: no cover
-    """Splits the DataFrame read into smaller DataFrames and handles all edge cases.
+    """
+    Split the read DataFrame into smaller DataFrames and handle all edge cases.
 
-    Args:
-        axis: Which axis to split over.
-        num_splits: The number of splits to create.
-        df: The DataFrame after it has been read.
+    Parameters
+    ----------
+    axis : int
+        The axis to split across (0 - index, 1 - columns).
+    num_splits : int
+        The number of splits to create.
+    df : pandas.DataFrame
+        `pandas.DataFrame` to split.
 
-    Returns:
+    Returns
+    -------
+    list
         A list of pandas DataFrames.
     """
     splits = split_result_of_axis_func_pandas(axis, num_splits, df)
@@ -43,6 +105,21 @@ def _split_result_for_readers(axis, num_splits, df):  # pragma: no cover
 
 
 def find_common_type_cat(types):
+    """
+    Find a common data type among the given dtypes.
+
+    Parameters
+    ----------
+    types : array-like
+        Array of dtypes.
+
+    Returns
+    -------
+    pandas.core.dtypes.dtypes.ExtensionDtype or
+    np.dtype or
+    None
+        `dtype` that is common for all passed `types`.
+    """
     if all(isinstance(t, pandas.CategoricalDtype) for t in types):
         if all(t.ordered for t in types):
             return pandas.CategoricalDtype(
@@ -54,20 +131,58 @@ def find_common_type_cat(types):
             sort_categories=all(t.ordered for t in types),
         ).dtype
     else:
-        return find_common_type(types)
+        return find_common_type(list(types))
 
 
 class PandasParser(object):
+    """Base class for parser classes with pandas backend."""
+
     @classmethod
     def get_dtypes(cls, dtypes_ids):
+        """
+        Get common for all partitions dtype for each of the columns.
+
+        Parameters
+        ----------
+        dtypes_ids : list
+            Array with references to the partitions dtypes objects.
+
+        Returns
+        -------
+        pandas.Series
+            pandas.Series where index is columns names and values are
+            columns dtypes.
+        """
+        partitions_dtypes = cls.materialize(dtypes_ids)
+        if all([len(dtype) == 0 for dtype in partitions_dtypes]):
+            return None
         return (
-            pandas.concat(cls.materialize(dtypes_ids), axis=1)
+            pandas.concat(partitions_dtypes, axis=1)
             .apply(lambda row: find_common_type_cat(row.values), axis=1)
             .squeeze(axis=0)
         )
 
     @classmethod
     def single_worker_read(cls, fname, **kwargs):
+        """
+        Perform reading by single worker (default-to-pandas implementation).
+
+        Parameters
+        ----------
+        fname : str, path object or file-like object
+            Name of the file or file-like object to read.
+        **kwargs : dict
+            Keywords arguments to be passed into `read_*` function.
+
+        Returns
+        -------
+        BaseQueryCompiler or
+        dict or
+        pandas.io.parsers.TextFileReader
+            Object with imported data (or with reference to data) for furher
+            processing, object type depends on the child class `parse` function
+            result type.
+        """
         ErrorMessage.default_to_pandas("Parameters provided")
         # Use default args for everything
         pandas_frame = cls.parse(fname, **kwargs)
@@ -89,23 +204,31 @@ class PandasParser(object):
     infer_compression = infer_compression
 
 
+@doc(_doc_pandas_parser_class, data_type="CSV files")
 class PandasCSVParser(PandasParser):
     @staticmethod
+    @doc(_doc_parse_func, parameters=_doc_parse_parameters_common)
     def parse(fname, **kwargs):
         warnings.filterwarnings("ignore")
         num_splits = kwargs.pop("num_splits", None)
         start = kwargs.pop("start", None)
         end = kwargs.pop("end", None)
-        index_col = kwargs.get("index_col", None)
+        header_size = kwargs.pop("header_size", None)
         if start is not None and end is not None:
             # pop "compression" from kwargs because bio is uncompressed
             bio = FileDispatcher.file_open(
                 fname, "rb", kwargs.pop("compression", "infer")
             )
-            if kwargs.get("encoding", None) is not None:
-                header = b"" + bio.readline()
-            else:
-                header = b""
+            header = b""
+            # In this case we beware that fisrt line can contain BOM, so
+            # adding this line to the `header` for reading and then skip it
+            if kwargs.get("encoding", None) is not None and header_size == 0:
+                header += bio.readline()
+                # `skiprows` can be only None here, so don't check it's type
+                # and just set to 1
+                kwargs["skiprows"] = 1
+            for _ in range(header_size):
+                header += bio.readline()
             bio.seek(start)
             to_read = header + bio.read(end - start)
             bio.close()
@@ -113,19 +236,27 @@ class PandasCSVParser(PandasParser):
         else:
             # This only happens when we are reading with only one worker (Default)
             return pandas.read_csv(fname, **kwargs)
-        if index_col is not None:
-            index = pandas_df.index
-        else:
-            # The lengths will become the RangeIndex
-            index = len(pandas_df)
+        index = (
+            pandas_df.index
+            if not isinstance(pandas_df.index, pandas.RangeIndex)
+            else len(pandas_df)
+        )
         return _split_result_for_readers(1, num_splits, pandas_df) + [
             index,
             pandas_df.dtypes,
         ]
 
 
+@doc(_doc_pandas_parser_class, data_type="multiple CSV files simultaneously")
 class PandasCSVGlobParser(PandasCSVParser):
     @staticmethod
+    @doc(
+        _doc_parse_func,
+        parameters="""chunks : list
+    List, where each element of the list is a list of tuples. The inner lists
+    of tuples contains the data file name of the chunk, chunk start offset, and
+    chunk end offsets for its corresponding file.""",
+    )
     def parse(chunks, **kwargs):
         warnings.filterwarnings("ignore")
         num_splits = kwargs.pop("num_splits", None)
@@ -170,8 +301,31 @@ class PandasCSVGlobParser(PandasCSVParser):
         ]
 
 
+@doc(_doc_pandas_parser_class, data_type="pickled pandas objects")
+class PandasPickleExperimentalParser(PandasParser):
+    @staticmethod
+    @doc(_doc_parse_func, parameters=_doc_parse_parameters_common)
+    def parse(fname, **kwargs):
+        warnings.filterwarnings("ignore")
+        num_splits = 1
+        single_worker_read = kwargs.pop("single_worker_read", None)
+        df = pandas.read_pickle(fname, **kwargs)
+        if single_worker_read:
+            return df
+        assert isinstance(
+            df, pandas.DataFrame
+        ), f"Pickled obj type: [{type(df)}] in [{fname}]; works only with pandas.DataFrame"
+
+        length = len(df)
+        width = len(df.columns)
+
+        return _split_result_for_readers(1, num_splits, df) + [length, width]
+
+
+@doc(_doc_pandas_parser_class, data_type="tables with fixed-width formatted lines")
 class PandasFWFParser(PandasParser):
     @staticmethod
+    @doc(_doc_parse_func, parameters=_doc_parse_parameters_common)
     def parse(fname, **kwargs):
         num_splits = kwargs.pop("num_splits", None)
         start = kwargs.pop("start", None)
@@ -204,9 +358,25 @@ class PandasFWFParser(PandasParser):
         ]
 
 
+@doc(_doc_pandas_parser_class, data_type="excel files")
 class PandasExcelParser(PandasParser):
     @classmethod
     def get_sheet_data(cls, sheet, convert_float):
+        """
+        Get raw data from the excel sheet.
+
+        Parameters
+        ----------
+        sheet : openpyxl.worksheet.worksheet.Worksheet
+            Sheet to get data from.
+        convert_float : bool
+            Whether to convert floats to ints or not.
+
+        Returns
+        -------
+        list
+            List with sheet data.
+        """
         return [
             [cls._convert_cell(cell, convert_float) for cell in row]
             for row in sheet.rows
@@ -214,6 +384,21 @@ class PandasExcelParser(PandasParser):
 
     @classmethod
     def _convert_cell(cls, cell, convert_float):
+        """
+        Convert excel cell to value.
+
+        Parameters
+        ----------
+        cell : openpyxl.cell.cell.Cell
+            Excel cell to convert.
+        convert_float : bool
+            Whether to convert floats to ints or not.
+
+        Returns
+        -------
+        list
+            Value that was converted from the excel cell.
+        """
         if cell.is_date:
             return cell.value
         elif cell.data_type == "e":
@@ -233,6 +418,7 @@ class PandasExcelParser(PandasParser):
         return cell.value
 
     @staticmethod
+    @doc(_doc_parse_func, parameters=_doc_parse_parameters_common)
     def parse(fname, **kwargs):
         num_splits = kwargs.pop("num_splits", None)
         start = kwargs.pop("start", None)
@@ -276,21 +462,24 @@ class PandasExcelParser(PandasParser):
                 bytes_data = file.read(end - start)
 
         def update_row_nums(match):
-            """Update the row numbers to start at 1.
-
-            Note: This is needed because the parser we are using does not scale well if
-            the row numbers remain because empty rows are inserted for all "missing"
-            rows.
+            """
+            Update the row numbers to start at 1.
 
             Parameters
             ----------
-            match
+            match : re.Match object
                 The match from the origin `re.sub` looking for row number tags.
 
             Returns
             -------
-            string
+            str
                 The updated string with new row numbers.
+
+            Notes
+            -----
+            This is needed because the parser we are using does not scale well if
+            the row numbers remain because empty rows are inserted for all "missing"
+            rows.
             """
             b = match.group(0)
             return re.sub(
@@ -346,10 +535,10 @@ class PandasExcelParser(PandasParser):
             has_index_names=is_list_like(header) and len(header) > 1,
             skiprows=skiprows,
             usecols=usecols,
-            **kwargs
+            **kwargs,
         )
         # In excel if you create a row with only a border (no values), this parser will
-        # interpret that as a row of NaN values. Pandas discards these values, so we
+        # interpret that as a row of NaN values. pandas discards these values, so we
         # also must discard these values.
         pandas_df = parser.read().dropna(how="all")
         # Since we know the number of rows that occur before this partition, we can
@@ -372,8 +561,10 @@ class PandasExcelParser(PandasParser):
         ]
 
 
+@doc(_doc_pandas_parser_class, data_type="JSON files")
 class PandasJSONParser(PandasParser):
     @staticmethod
+    @doc(_doc_parse_func, parameters=_doc_parse_parameters_common)
     def parse(fname, **kwargs):
         num_splits = kwargs.pop("num_splits", None)
         start = kwargs.pop("start", None)
@@ -401,8 +592,10 @@ class PandasJSONParser(PandasParser):
         ]
 
 
+@doc(_doc_pandas_parser_class, data_type="PARQUET data")
 class PandasParquetParser(PandasParser):
     @staticmethod
+    @doc(_doc_parse_func, parameters=_doc_parse_parameters_common)
     def parse(fname, **kwargs):
         num_splits = kwargs.pop("num_splits", None)
         columns = kwargs.get("columns", None)
@@ -432,8 +625,14 @@ class PandasParquetParser(PandasParser):
         return _split_result_for_readers(0, num_splits, df) + [idx, df.dtypes]
 
 
+@doc(_doc_pandas_parser_class, data_type="HDF data")
 class PandasHDFParser(PandasParser):  # pragma: no cover
     @staticmethod
+    @doc(
+        _doc_parse_func,
+        parameters="""fname : str, path object, pandas.HDFStore or file-like object
+    Name of the file, path pandas.HDFStore or file-like object to read.""",
+    )
     def parse(fname, **kwargs):
         kwargs["key"] = kwargs.pop("_key", None)
         num_splits = kwargs.pop("num_splits", None)
@@ -444,8 +643,14 @@ class PandasHDFParser(PandasParser):  # pragma: no cover
         return _split_result_for_readers(0, num_splits, df) + [len(df.index), df.dtypes]
 
 
+@doc(_doc_pandas_parser_class, data_type="FEATHER files")
 class PandasFeatherParser(PandasParser):
     @staticmethod
+    @doc(
+        _doc_parse_func,
+        parameters="""fname : str, path object or file-like object
+    Name of the file, path or file-like object to read.""",
+    )
     def parse(fname, **kwargs):
         from pyarrow import feather
 
@@ -457,8 +662,18 @@ class PandasFeatherParser(PandasParser):
         return _split_result_for_readers(0, num_splits, df) + [len(df.index), df.dtypes]
 
 
+@doc(_doc_pandas_parser_class, data_type="SQL queries or tables")
 class PandasSQLParser(PandasParser):
     @staticmethod
+    @doc(
+        _doc_parse_func,
+        parameters="""sql : str or SQLAlchemy Selectable (select or text object)
+    SQL query to be executed or a table name.
+con : SQLAlchemy connectable, str, or sqlite3 connection
+    Connection object to database.
+index_col : str or list of str
+    Column(s) to set as index(MultiIndex).""",
+    )
     def parse(sql, con, index_col, **kwargs):
         num_splits = kwargs.pop("num_splits", None)
         if num_splits is None:

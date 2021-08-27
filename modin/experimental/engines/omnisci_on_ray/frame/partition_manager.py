@@ -11,9 +11,14 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module provides a partition manager class for ``OmnisciOnRayFrame`` frame."""
+
+from modin.pandas.utils import is_scalar
 import numpy as np
 
-from modin.engines.ray.generic.frame.partition_manager import RayFrameManager
+from modin.engines.ray.generic.frame.partition_manager import (
+    GenericRayFramePartitionManager,
+)
 from .axis_partition import (
     OmnisciOnRayFrameColumnPartition,
     OmnisciOnRayFrameRowPartition,
@@ -29,27 +34,66 @@ import pandas
 import re
 
 
-class OmnisciOnRayFrameManager(RayFrameManager):
-    """This method implements the interface in `BaseFrameManager`."""
+class OmnisciOnRayFramePartitionManager(GenericRayFramePartitionManager):
+    """
+    Frame manager for ``OmnisciOnRayFrame``.
 
-    # This object uses RayRemotePartition objects as the underlying store.
+    This class handles several features of ``OmnisciOnRayFrame``:
+      - frame always has a single partition
+      - frame cannot process some data types
+      - frame has to use mangling for index labels
+      - frame uses OmniSci engine for execution
+    """
+
     _partition_class = OmnisciOnRayFramePartition
     _column_partitions_class = OmnisciOnRayFrameColumnPartition
     _row_partition_class = OmnisciOnRayFrameRowPartition
 
     @classmethod
     def _compute_num_partitions(cls):
-        """Currently, we don't handle partitioned frames for OmniSci engine.
-        Since we support a single node mode only, allow OmniSci perform
-        partitioning by itself.
+        """
+        Return a number of partitions a frame should be split to.
 
-        :return:
+        `OmnisciOnRayFrame` always has a single partition.
+
+        Returns
+        -------
+        int
         """
         return 1
 
     @classmethod
     def from_pandas(cls, df, return_dims=False):
+        """
+        Create ``OmnisciOnRayFrame`` from ``pandas.DataFrame``.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Source frame.
+        return_dims : bool, default: False
+            Include reulsintg dimensions into the returned value.
+
+        Returns
+        -------
+        tuple
+            Tuple holding array of partitions, list of columns with unsupported
+            data and optionally partitions' dimensions.
+        """
+
         def tuple_wrapper(obj):
+            """
+            Wrap non-tuple object into a tuple.
+
+            Parameters
+            ----------
+            obj : Any.
+                Wrapped object.
+
+            Returns
+            -------
+            tuple
+            """
             if not isinstance(obj, tuple):
                 obj = (obj,)
             return obj
@@ -74,6 +118,25 @@ class OmnisciOnRayFrameManager(RayFrameManager):
 
     @classmethod
     def from_arrow(cls, at, return_dims=False, unsupported_cols=None):
+        """
+        Build frame from Arrow table.
+
+        Parameters
+        ----------
+        at : pyarrow.Table
+            Input table.
+        return_dims : bool, default: False
+            True to include dimensions into returned tuple.
+        unsupported_cols : list of str, optional
+            List of columns holding unsupported data. If None then
+            check all columns to compute the list.
+
+        Returns
+        -------
+        tuple
+            Tuple holding array of partitions, list of columns with unsupported
+            data and optionally partitions' dimensions.
+        """
         put_func = cls._partition_class.put_arrow
 
         parts = [[put_func(at)]]
@@ -90,17 +153,18 @@ class OmnisciOnRayFrameManager(RayFrameManager):
     @classmethod
     def _get_unsupported_cols(cls, obj):
         """
-        Finds columns with unsupported dtypes by OmniSci, and returns list of it.
+        Return a list of columns with unsupported by OmniSci data types.
 
         Parameters
         ----------
-            obj : pandas.DataFrame or pyarrow.Table, object to inspect on
-                unsupported column types.
+        obj : pandas.DataFrame or pyarrow.Table
+            Object to inspect on unsupported column types.
 
         Returns
         -------
-            Tuple of pyarrow.Table representation of `obj` (for future using) and
-            a list of unsupported columns.
+        tuple
+            Arrow representation of `obj` (for future using) and a list of
+            unsupported columns.
         """
         if isinstance(obj, (pandas.Series, pandas.DataFrame)):
             # picking first rows from cols with `dtype="object"` to check its actual type,
@@ -109,7 +173,10 @@ class OmnisciOnRayFrameManager(RayFrameManager):
             type_samples = obj.iloc[0][cols]
 
             unsupported_cols = [
-                name for name, col in type_samples.items() if not isinstance(col, str)
+                name
+                for name, col in type_samples.items()
+                if not isinstance(col, str)
+                and not (is_scalar(col) and pandas.isna(col))
             ]
 
             if len(unsupported_cols) > 0:
@@ -117,7 +184,7 @@ class OmnisciOnRayFrameManager(RayFrameManager):
 
             try:
                 at = pyarrow.Table.from_pandas(obj)
-            except pyarrow.lib.ArrowTypeError as e:
+            except (pyarrow.lib.ArrowTypeError, pyarrow.lib.ArrowInvalid) as e:
                 regex = r"Conversion failed for column ([^\W]*)"
                 unsupported_cols = []
                 for msg in e.args:
@@ -143,10 +210,25 @@ class OmnisciOnRayFrameManager(RayFrameManager):
 
     @classmethod
     def run_exec_plan(cls, plan, index_cols, dtypes, columns):
-        # TODO: this plan is supposed to be executed remotely using Ray.
-        # For now OmniSci engine support only a single node cluster.
-        # Therefore remote execution is not necessary and will be added
-        # later.
+        """
+        Run execution plan in OmniSci engine to materialize frame.
+
+        Parameters
+        ----------
+        plan : DFAlgNode
+            A root of an execution plan tree.
+        index_cols : list of str
+            A list of index columns.
+        dtypes : pandas.Index
+            Column data types.
+        columns : list of str
+            A frame column names.
+
+        Returns
+        -------
+        np.array
+            Created frame's partitions.
+        """
         omniSession = OmnisciServer()
 
         # First step is to make sure all partitions are in OmniSci.
@@ -189,18 +271,60 @@ class OmnisciOnRayFrameManager(RayFrameManager):
 
     @classmethod
     def _names_from_index_cols(cls, cols):
+        """
+        Get index labels.
+
+        Deprecated.
+
+        Parameters
+        ----------
+        cols : list of str
+            Index columns.
+
+        Returns
+        -------
+        list of str
+        """
         if len(cols) == 1:
             return cls._name_from_index_col(cols[0])
         return [cls._name_from_index_col(n) for n in cols]
 
     @classmethod
     def _name_from_index_col(cls, col):
+        """
+        Get index label.
+
+        Deprecated.
+
+        Parameters
+        ----------
+        col : str
+            Index column.
+
+        Returns
+        -------
+        str
+        """
         if col.startswith("__index__"):
             return None
         return col
 
     @classmethod
     def _maybe_scalar(cls, lst):
+        """
+        Transform list with a single element to scalar.
+
+        Deprecated.
+
+        Parameters
+        ----------
+        lst : list
+            Input list.
+
+        Returns
+        -------
+        Any
+        """
         if len(lst) == 1:
             return lst[0]
         return lst

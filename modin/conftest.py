@@ -20,15 +20,35 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import shutil
 
-import modin
-import modin.config
-from modin.config import IsExperimental
+assert (
+    "modin.utils" not in sys.modules
+), "Do not import modin.utils before patching, or tests could fail"
+# every import under this assert has to be postfixed with 'noqa: E402'
+# as flake8 complains about that... but we _have_ to make sure we
+# monkey-patch at the right spot, otherwise testing doc URLs might
+# not catch all of them
+import modin.utils  # noqa: E402
 
-from modin.backends import PandasQueryCompiler, BaseQueryCompiler
-from modin.engines.python.pandas_on_python.io import PandasOnPythonIO
-from modin.data_management.factories import factories
-from modin.utils import get_current_backend
-from modin.pandas.test.utils import (
+_generated_doc_urls = set()
+
+
+def _saving_make_api_url(token, _make_api_url=modin.utils._make_api_url):
+    url = _make_api_url(token)
+    _generated_doc_urls.add(url)
+    return url
+
+
+modin.utils._make_api_url = _saving_make_api_url
+
+import modin  # noqa: E402
+import modin.config  # noqa: E402
+from modin.config import IsExperimental, TestRayClient  # noqa: E402
+
+from modin.backends import PandasQueryCompiler, BaseQueryCompiler  # noqa: E402
+from modin.engines.python.pandas_on_python.io import PandasOnPythonIO  # noqa: E402
+from modin.data_management.factories import factories  # noqa: E402
+from modin.utils import get_current_backend  # noqa: E402
+from modin.pandas.test.utils import (  # noqa: E402
     _make_csv_file,
     get_unique_filename,
     teardown_test_files,
@@ -107,15 +127,17 @@ def simulate_cloud(request):
     assert IsExperimental.get(), "Simulated cloud must be started in experimental mode"
 
     from modin.experimental.cloud import create_cluster, get_connection
-    import pandas._testing
-    import pandas._libs.testing as cyx_testing
+    import modin.pandas.test.utils
 
     with create_cluster("local", cluster_type="local"):
         get_connection().teleport(set_experimental_env)(mode)
         with Patcher(
             get_connection(),
-            (pandas._testing, "assert_class_equal"),
-            (cyx_testing, "assert_almost_equal"),
+            (modin.pandas.test.utils, "assert_index_equal"),
+            (modin.pandas.test.utils, "assert_series_equal"),
+            (modin.pandas.test.utils, "assert_frame_equal"),
+            (modin.pandas.test.utils, "assert_extension_array_equal"),
+            (modin.pandas.test.utils, "assert_empty_frame_equal"),
         ):
             yield
 
@@ -426,3 +448,31 @@ def TestReadGlobCSVFixture():
     yield
 
     teardown_test_files(filenames)
+
+
+@pytest.fixture
+def get_generated_doc_urls():
+    return lambda: _generated_doc_urls
+
+
+ray_client_server = None
+
+
+def pytest_sessionstart(session):
+    if TestRayClient.get():
+        import ray
+        import ray.util.client.server.server as ray_server
+
+        addr = "localhost:50051"
+        global ray_client_server
+        ray_client_server = ray_server.serve(addr)
+        ray.util.connect(addr)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if TestRayClient.get():
+        import ray
+
+        ray.util.disconnect()
+        if ray_client_server:
+            ray_client_server.stop(0)

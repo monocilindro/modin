@@ -11,6 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module houses `CSVGlobDispatcher` class, that is used for reading multiple `.csv` files simultaneously."""
+
 from contextlib import ExitStack
 import csv
 import glob
@@ -20,17 +22,37 @@ from typing import List, Tuple
 import warnings
 
 import pandas
-from pandas.io.parsers import _validate_usecols_arg
+import pandas._libs.lib as lib
 
 from modin.config import NPartitions
-from modin.data_management.utils import compute_chunksize
 from modin.engines.base.io.file_dispatcher import S3_ADDRESS_REGEX
 from modin.engines.base.io.text.csv_dispatcher import CSVDispatcher
 
 
 class CSVGlobDispatcher(CSVDispatcher):
+    """
+    Class contains utils for reading multiple `.csv` files simultaneously.
+
+    Inherits some common for `.csv` files util functions from `CSVDispatcher` class.
+    """
+
     @classmethod
     def _read(cls, filepath_or_buffer, **kwargs):
+        """
+        Read data from multiple `.csv` files passed with `filepath_or_buffer` simultaneously.
+
+        Parameters
+        ----------
+        filepath_or_buffer : str, path object or file-like object
+            `filepath_or_buffer` parameter of ``read_csv`` function.
+        **kwargs : dict
+            Parameters of ``read_csv`` function.
+
+        Returns
+        -------
+        new_query_compiler : BaseQueryCompiler
+            Query compiler with imported data for further processing.
+        """
         # Ensures that the file is a string file path. Otherwise, default to pandas.
         filepath_or_buffer = cls.get_path_or_buffer(filepath_or_buffer)
         if isinstance(filepath_or_buffer, str):
@@ -74,11 +96,11 @@ class CSVGlobDispatcher(CSVDispatcher):
             return cls.single_worker_read(filepath_or_buffer, **kwargs)
 
         nrows = kwargs.pop("nrows", None)
-        names = kwargs.get("names", None)
+        names = kwargs.get("names", lib.no_default)
         index_col = kwargs.get("index_col", None)
         usecols = kwargs.get("usecols", None)
         encoding = kwargs.get("encoding", None)
-        if names is None:
+        if names in [lib.no_default, None]:
             # For the sake of the empty df, we assume no `index_col` to get the correct
             # column names before we build the index. Because we pass `names` in, this
             # step has to happen without removing the `index_col` otherwise it will not
@@ -105,7 +127,7 @@ class CSVGlobDispatcher(CSVDispatcher):
         column_names = empty_pd_df.columns
         skipfooter = kwargs.get("skipfooter", None)
         skiprows = kwargs.pop("skiprows", None)
-        usecols_md = _validate_usecols_arg(usecols)
+        usecols_md = cls._validate_usecols_arg(usecols)
         if usecols is not None and usecols_md[1] != "integer":
             del kwargs["usecols"]
             all_cols = pandas.read_csv(
@@ -141,7 +163,10 @@ class CSVGlobDispatcher(CSVDispatcher):
                 if skiprows is None:
                     skiprows = 0
                 header = kwargs.get("header", "infer")
-                if header == "infer" and kwargs.get("names", None) is None:
+                if header == "infer" and kwargs.get("names", lib.no_default) in [
+                    lib.no_default,
+                    None,
+                ]:
                     skip_header = 1
                 elif isinstance(header, int):
                     skip_header = header + 1
@@ -155,26 +180,7 @@ class CSVGlobDispatcher(CSVDispatcher):
             partition_ids = []
             index_ids = []
             dtypes_ids = []
-            # Max number of partitions available
-            num_partitions = NPartitions.get()
-            # This is the number of splits for the columns
-            num_splits = min(len(column_names), num_partitions)
-            # Metadata
-            column_chunksize = compute_chunksize(empty_pd_df, num_splits, axis=1)
-            if column_chunksize > len(column_names):
-                column_widths = [len(column_names)]
-                # This prevents us from unnecessarily serializing a bunch of empty
-                # objects.
-                num_splits = 1
-            else:
-                column_widths = [
-                    column_chunksize
-                    if len(column_names) > (column_chunksize * (i + 1))
-                    else 0
-                    if len(column_names) < (column_chunksize * i)
-                    else len(column_names) - (column_chunksize * i)
-                    for i in range(num_splits)
-                ]
+            column_widths, num_splits = cls._define_metadata(empty_pd_df, column_names)
 
             args = {
                 "num_splits": num_splits,
@@ -184,7 +190,7 @@ class CSVGlobDispatcher(CSVDispatcher):
             splits = cls.partitioned_file(
                 files,
                 glob_filepaths,
-                num_partitions=num_partitions,
+                num_partitions=NPartitions.get(),
                 nrows=nrows,
                 skiprows=skiprows,
                 skip_header=skip_header,
@@ -257,23 +263,23 @@ class CSVGlobDispatcher(CSVDispatcher):
         if kwargs.get("squeeze", False) and len(new_query_compiler.columns) == 1:
             return new_query_compiler[new_query_compiler.columns[0]]
         if index_col is None:
-            new_query_compiler._modin_frame._apply_index_objs(axis=0)
+            new_query_compiler._modin_frame.synchronize_labels(axis=0)
         return new_query_compiler
 
     @classmethod
     def file_exists(cls, file_path: str) -> bool:
         """
-        Checks if the file_path is valid.
+        Check if the `file_path` is valid.
 
         Parameters
         ----------
-        file_path: str
+        file_path : str
             String representing a path.
 
         Returns
         -------
         bool
-            True if the glob path is valid.
+            True if the path is valid.
         """
         if isinstance(file_path, str):
             match = S3_ADDRESS_REGEX.search(file_path)
@@ -296,11 +302,11 @@ class CSVGlobDispatcher(CSVDispatcher):
     @classmethod
     def get_path(cls, file_path: str) -> list:
         """
-        Returns the path of the file(s).
+        Return the path of the file(s).
 
         Parameters
         ----------
-        file_path: str
+        file_path : str
             String representing a path.
 
         Returns
@@ -350,33 +356,34 @@ class CSVGlobDispatcher(CSVDispatcher):
 
         Parameters
         ----------
-        files: file or list of files
+        files : file or list of files
             File(s) to be partitioned.
-        fnames: str or list of str
+        fnames : str or list of str
             File name(s) to be partitioned.
-        num_partitions: int, optional
+        num_partitions : int, optional
             For what number of partitions split a file.
             If not specified grabs the value from `modin.config.NPartitions.get()`.
-        nrows: int, optional
+        nrows : int, optional
             Number of rows of file to read.
-        skiprows: int, optional
+        skiprows : int, optional
             Specifies rows to skip.
-        skip_header: int, optional
+        skip_header : int, optional
             Specifies header rows to skip.
-        quotechar: bytes, default b'"'
+        quotechar : bytes, default: b'"'
             Indicate quote in a file.
-        is_quoting: bool, default True
+        is_quoting : bool, default: True
             Whether or not to consider quotes.
-
-        Notes
-        -----
-        The logic gets really complicated if we try to use the TextFileDispatcher.partitioned_file().
 
         Returns
         -------
         list
             List, where each element of the list is a list of tuples. The inner lists
-            of tuples contains the data file name of the chunk, chunk start offset, and chunk end offsets for its corresponding file.
+            of tuples contains the data file name of the chunk, chunk start offset, and
+            chunk end offsets for its corresponding file.
+
+        Notes
+        -----
+        The logic gets really complicated if we try to use the `TextFileDispatcher.partitioned_file`.
         """
         if type(files) != list:
             files = [files]

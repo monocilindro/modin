@@ -11,8 +11,9 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module houses `JSONDispatcher` class, that is used for reading `.json` files."""
+
 from modin.engines.base.io.text.text_file_dispatcher import TextFileDispatcher
-from modin.data_management.utils import compute_chunksize
 from io import BytesIO
 import pandas
 import numpy as np
@@ -22,8 +23,29 @@ from modin.config import NPartitions
 
 
 class JSONDispatcher(TextFileDispatcher):
+    """
+    Class handles utils for reading `.json` files.
+
+    Inherits some common for text files util functions from `TextFileDispatcher` class.
+    """
+
     @classmethod
     def _read(cls, path_or_buf, **kwargs):
+        """
+        Read data from `path_or_buf` according to the passed `read_json` `kwargs` parameters.
+
+        Parameters
+        ----------
+        path_or_buf : str, path object or file-like object
+            `path_or_buf` parameter of `read_json` function.
+        **kwargs : dict
+            Parameters of `read_json` function.
+
+        Returns
+        -------
+        BaseQueryCompiler
+            Query compiler with imported data for further processing.
+        """
         path_or_buf = cls.get_path_or_buffer(path_or_buf)
         if isinstance(path_or_buf, str):
             if not cls.file_exists(path_or_buf):
@@ -40,30 +62,17 @@ class JSONDispatcher(TextFileDispatcher):
         empty_pd_df = pandas.DataFrame(columns=columns)
 
         with cls.file_open(path_or_buf, "rb", kwargs.get("compression", "infer")) as f:
-            num_partitions = NPartitions.get()
-            num_splits = min(len(columns), num_partitions)
-
             partition_ids = []
             index_ids = []
             dtypes_ids = []
 
-            column_chunksize = compute_chunksize(empty_pd_df, num_splits, axis=1)
-            if column_chunksize > len(columns):
-                column_widths = [len(columns)]
-                num_splits = 1
-            else:
-                column_widths = [
-                    column_chunksize
-                    if i != num_splits - 1
-                    else len(columns) - (column_chunksize * (num_splits - 1))
-                    for i in range(num_splits)
-                ]
+            column_widths, num_splits = cls._define_metadata(empty_pd_df, columns)
 
             args = {"fname": path_or_buf, "num_splits": num_splits, **kwargs}
 
             splits = cls.partitioned_file(
                 f,
-                num_partitions=num_partitions,
+                num_partitions=NPartitions.get(),
                 is_quoting=(args.get("quoting", "") != QUOTE_NONE),
             )
             for start, end in splits:
@@ -94,5 +103,5 @@ class JSONDispatcher(TextFileDispatcher):
             column_widths,
             dtypes=dtypes,
         )
-        new_frame._apply_index_objs(axis=0)
+        new_frame.synchronize_labels(axis=0)
         return cls.query_compiler_cls(new_frame)

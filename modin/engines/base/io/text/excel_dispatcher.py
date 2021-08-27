@@ -11,12 +11,13 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module houses `ExcelDispatcher` class, that is used for reading excel files."""
+
 import pandas
 import re
 import sys
 import warnings
 
-from modin.data_management.utils import compute_chunksize
 from modin.engines.base.io.text.text_file_dispatcher import TextFileDispatcher
 from modin.config import NPartitions
 
@@ -24,8 +25,29 @@ EXCEL_READ_BLOCK_SIZE = 4096
 
 
 class ExcelDispatcher(TextFileDispatcher):
+    """
+    Class handles utils for reading excel files.
+
+    Inherits some common for text files util functions from `TextFileDispatcher` class.
+    """
+
     @classmethod
     def _read(cls, io, **kwargs):
+        """
+        Read data from `io` according to the passed `read_excel` `kwargs` parameters.
+
+        Parameters
+        ----------
+        io : str, bytes, ExcelFile, xlrd.Book, path object, or file-like object
+            `io` parameter of `read_excel` function.
+        **kwargs : dict
+            Parameters of `read_excel` function.
+
+        Returns
+        -------
+        new_query_compiler : BaseQueryCompiler
+            Query compiler with imported data for further processing.
+        """
         if (
             kwargs.get("engine", None) is not None
             and kwargs.get("engine") != "openpyxl"
@@ -98,7 +120,6 @@ class ExcelDispatcher(TextFileDispatcher):
             f = BytesIO(f.read())
             total_bytes = cls.file_size(f)
 
-            num_partitions = NPartitions.get()
             # Read some bytes from the sheet so we can extract the XML header and first
             # line. We need to make sure we get the first line of the data as well
             # because that is where the column names are. The header information will
@@ -136,8 +157,10 @@ class ExcelDispatcher(TextFileDispatcher):
                 column_names = df.columns
 
             # Compute partition metadata upfront so it is uniform for all partitions
-            chunk_size = max(1, (total_bytes - f.tell()) // num_partitions)
-            num_splits = min(len(column_names), num_partitions)
+            chunk_size = max(1, (total_bytes - f.tell()) // NPartitions.get())
+            column_widths, num_splits = cls._define_metadata(
+                pandas.DataFrame(columns=column_names), column_names
+            )
             kwargs["fname"] = io
             # Skiprows will be used to inform a partition how many rows come before it.
             kwargs["skiprows"] = 0
@@ -146,24 +169,6 @@ class ExcelDispatcher(TextFileDispatcher):
             index_ids = []
             dtypes_ids = []
 
-            # Compute column metadata
-            column_chunksize = compute_chunksize(
-                pandas.DataFrame(columns=column_names), num_splits, axis=1
-            )
-            if column_chunksize > len(column_names):
-                column_widths = [len(column_names)]
-                # This prevents us from unnecessarily serializing a bunch of empty
-                # objects.
-                num_splits = 1
-            else:
-                column_widths = [
-                    column_chunksize
-                    if len(column_names) > (column_chunksize * (i + 1))
-                    else 0
-                    if len(column_names) < (column_chunksize * i)
-                    else len(column_names) - (column_chunksize * i)
-                    for i in range(num_splits)
-                ]
             kwargs["num_splits"] = num_splits
 
             while f.tell() < total_bytes:
@@ -231,5 +236,5 @@ class ExcelDispatcher(TextFileDispatcher):
         )
         new_query_compiler = cls.query_compiler_cls(new_frame)
         if index_col is None:
-            new_query_compiler._modin_frame._apply_index_objs(axis=0)
+            new_query_compiler._modin_frame.synchronize_labels(axis=0)
         return new_query_compiler

@@ -11,16 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
-"""
-Implement DataFrame/Series public API as Pandas does.
-
-Almost all docstrings for public and magic methods should be inherited from Pandas
-for better maintability. So some codes are ignored in pydocstyle check:
-    - D101: missing docstring in class
-    - D102: missing docstring in public method
-    - D105: missing docstring in magic method
-Manually add documentation for methods which are not presented in pandas.
-"""
+"""Implement DataFrame/Series public API as pandas does."""
 
 import numpy as np
 from numpy import nan
@@ -42,7 +33,9 @@ from pandas.core.indexing import convert_to_index_sliceable
 from pandas.util._validators import validate_bool_kwarg, validate_percentile
 from pandas._libs.lib import no_default
 from pandas._typing import (
+    CompressionOptions,
     IndexKeyFunc,
+    FilePathOrBuffer,
     StorageOptions,
     TimedeltaConvertibleTypes,
     TimestampConvertibleTypes,
@@ -97,6 +90,7 @@ _DEFAULT_BEHAVIOUR = {
 } | _ATTRS_NO_LOOKUP
 
 
+@_inherit_docstrings(pandas.DataFrame, apilink="pandas.DataFrame")
 class BasePandasDataset(object):
     """
     Implement most of the common code that exists in DataFrame/Series.
@@ -116,21 +110,15 @@ class BasePandasDataset(object):
 
     def _add_sibling(self, sibling):
         """
-        Implement [METHOD_NAME].
+        Add a DataFrame or Series object to the list of siblings.
 
-        TODO: Add more details for this docstring template.
+        Siblings are objects that share the same query compiler. This function is called
+        when a shallow copy is made.
 
         Parameters
         ----------
-        What arguments does this function have.
-        [
-        PARAMETER_NAME: PARAMETERS TYPES
-            Description.
-        ]
-
-        Returns
-        -------
-        What this returns (if anything)
+        sibling : BasePandasDataset
+            Dataset to add to siblings list.
         """
         sibling._siblings = self._siblings + [self]
         self._siblings += [sibling]
@@ -139,21 +127,25 @@ class BasePandasDataset(object):
 
     def _build_repr_df(self, num_rows, num_cols):
         """
-        Implement [METHOD_NAME].
-
-        TODO: Add more details for this docstring template.
+        Build pandas DataFrame for string representation.
 
         Parameters
         ----------
-        What arguments does this function have.
-        [
-        PARAMETER_NAME: PARAMETERS TYPES
-            Description.
-        ]
+        num_rows : int
+            Number of rows to show in string representation. If number of
+            rows in this dataset is greater than `num_rows` then half of
+            `num_rows` rows from the beginning and half of `num_rows` rows
+            from the end are shown.
+        num_cols : int
+            Number of columns to show in string representation. If number of
+            columns in this dataset is greater than `num_cols` then half of
+            `num_cols` columns from the beginning and half of `num_cols`
+            columns from the end are shown.
 
         Returns
         -------
-        What this returns (if anything)
+        pandas.DataFrame or pandas.Series
+            A pandas dataset with `num_rows` or fewer rows and `num_cols` or fewer columns.
         """
         # Fast track for empty dataframe.
         if len(self.index) == 0 or (
@@ -210,8 +202,8 @@ class BasePandasDataset(object):
 
         Parameters
         ----------
-        new_query_compiler: query_compiler
-            The new QueryCompiler to use to manage the data
+        new_query_compiler : query_compiler
+            The new QueryCompiler to use to manage the data.
         """
         old_query_compiler = self._query_compiler
         self._query_compiler = new_query_compiler
@@ -232,19 +224,37 @@ class BasePandasDataset(object):
         """
         Help to check validity of other in inter-df operations.
 
-        TODO: Add more details for this docstring template.
-
         Parameters
         ----------
-        What arguments does this function have.
-        [
-        PARAMETER_NAME: PARAMETERS TYPES
-            Description.
-        ]
+        other : modin.pandas.BasePandasDataset
+            Another dataset to validate against `self`.
+        axis : {None, 0, 1}
+            Specifies axis along which to do validation. When `1` or `None`
+            is specified, validation is done along `index`, if `0` is specified
+            validation is done along `columns` of `other` frame.
+        numeric_only : bool, default: False
+            Validates that both frames have only numeric dtypes.
+        numeric_or_time_only : bool, default: False
+            Validates that both frames have either numeric or time dtypes.
+        numeric_or_object_only : bool, default: False
+            Validates that both frames have either numeric or object dtypes.
+        comparison_dtypes_only : bool, default: False
+            Validates that both frames have either numeric or time or equal dtypes.
+        compare_index : bool, default: False
+            Compare Index if True.
 
         Returns
         -------
-        What this returns (if anything)
+        modin.pandas.BasePandasDataset
+            Other frame if it is determined to be valid.
+
+        Raises
+        ------
+        ValueError
+            If `other` is `Series` and its length is different from
+            length of `self` `axis`.
+        TypeError
+            If any validation checks fail.
         """
         # We skip dtype checking if the other is a scalar.
         if is_scalar(other):
@@ -325,23 +335,67 @@ class BasePandasDataset(object):
                 )
         return result
 
-    def _binary_op(self, op, other, **kwargs):
+    def _validate_function(self, func, on_invalid=None):
         """
-        Implement [METHOD_NAME].
-
-        TODO: Add more details for this docstring template.
+        Check the validity of the function which is intended to be applied to the frame.
 
         Parameters
         ----------
-        What arguments does this function have.
-        [
-        PARAMETER_NAME: PARAMETERS TYPES
-            Description.
-        ]
+        func : object
+        on_invalid : callable(str, cls), optional
+            Function to call in case invalid `func` is met, `on_invalid` takes an error
+            message and an exception type as arguments. If not specified raise an
+            appropriate exception.
+            **Note:** This parameter is a hack to concord with pandas error types.
+        """
+
+        def error_raiser(msg, exception=Exception):
+            raise exception(msg)
+
+        if on_invalid is None:
+            on_invalid = error_raiser
+
+        if isinstance(func, dict):
+            [self._validate_function(fn, on_invalid) for fn in func.values()]
+            return
+            # We also could validate this, but it may be quite expensive for lazy-frames
+            # if not all(idx in self.axes[axis] for idx in func.keys()):
+            #     error_raiser("Invalid dict keys", KeyError)
+
+        if not is_list_like(func):
+            func = [func]
+
+        for fn in func:
+            if isinstance(fn, str):
+                if not (hasattr(self, fn) or hasattr(np, fn)):
+                    on_invalid(
+                        f"{fn} is not valid function for {type(self)} object.",
+                        AttributeError,
+                    )
+            elif not callable(fn):
+                on_invalid(
+                    f"One of the passed functions has an invalid type: {type(fn)}: {fn}, "
+                    "only callable or string is acceptable.",
+                    TypeError,
+                )
+
+    def _binary_op(self, op, other, **kwargs):
+        """
+        Do binary operation between two datasets.
+
+        Parameters
+        ----------
+        op : str
+            Name of binary operation.
+        other : modin.pandas.BasePandasDataset
+            Second operand of binary operation.
+        **kwargs : dict
+            Additional parameters to binary operation.
 
         Returns
         -------
-        What this returns (if anything)
+        modin.pandas.BasePandasDataset
+            Result of binary operation.
         """
         # _axis indicates the operator will use the default axis
         if kwargs.pop("_axis", None) is None:
@@ -375,21 +429,21 @@ class BasePandasDataset(object):
 
     def _default_to_pandas(self, op, *args, **kwargs):
         """
-        Help to use default pandas function.
-
-        TODO: Add more details for this docstring template.
+        Convert dataset to pandas type and call a pandas function on it.
 
         Parameters
         ----------
-        What arguments does this function have.
-        [
-        PARAMETER_NAME: PARAMETERS TYPES
-            Description.
-        ]
+        op : str
+            Name of pandas function.
+        *args : list
+            Additional positional arguments to be passed to `op`.
+        **kwargs : dict
+            Additional keywords arguments to be passed to `op`.
 
         Returns
         -------
-        What this returns (if anything)
+        object
+            Result of operation.
         """
         empty_self_str = "" if not self.empty else " for empty DataFrame"
         ErrorMessage.default_to_pandas(
@@ -466,17 +520,32 @@ class BasePandasDataset(object):
 
         Parameters
         ----------
-        axis: int, str
+        axis : int, str
             Axis name ('index' or 'columns') or number to be converted to axis index.
 
         Returns
         -------
-        Axis index in the array of axes stored in the dataframe.
+        int
+            0 or 1 - axis index in the array of axes stored in the dataframe.
         """
         return cls._pandas_class._get_axis_number(axis) if axis is not None else 0
 
     def __constructor__(self, *args, **kwargs):
-        """Construct DataFrame or Series object depending on self type."""
+        """
+        Construct DataFrame or Series object depending on self type.
+
+        Parameters
+        ----------
+        *args : list
+            Additional positional arguments to be passed to constructor.
+        **kwargs : dict
+            Additional keywords arguments to be passed to constructor.
+
+        Returns
+        -------
+        modin.pandas.BasePandasDataset
+            Constructed object.
+        """
         return type(self)(*args, **kwargs)
 
     def abs(self):
@@ -487,11 +556,9 @@ class BasePandasDataset(object):
         """
         Set the index for this DataFrame.
 
-        TODO: add types.
-
         Parameters
         ----------
-        new_index:
+        new_index : pandas.Index
             The new index to set this.
         """
         self._query_compiler.index = new_index
@@ -502,7 +569,8 @@ class BasePandasDataset(object):
 
         Returns
         -------
-        The union of all indexes across the partitions.
+        pandas.Index
+            The union of all indexes across the partitions.
         """
         return self._query_compiler.index
 
@@ -519,6 +587,7 @@ class BasePandasDataset(object):
 
         if axis == 0:
             result = self._aggregate(func, _axis=axis, *args, **kwargs)
+        # TODO: handle case when axis == 1
         if result is None:
             kwargs.pop("is_transform", None)
             return self.apply(func, axis=axis, args=args, **kwargs)
@@ -527,6 +596,26 @@ class BasePandasDataset(object):
     agg = aggregate
 
     def _aggregate(self, func, *args, **kwargs):
+        """
+        Aggregate using one or more operations over index axis.
+
+        Parameters
+        ----------
+        func : function, str, list or dict
+            Function to use for aggregating the data.
+        *args : list
+            Positional arguments to pass to func.
+        **kwargs : dict
+            Keyword arguments to pass to func.
+
+        Returns
+        -------
+        scalar or BasePandasDataset
+
+        See Also
+        --------
+        aggregate : Aggregate along any axis.
+        """
         _axis = kwargs.pop("_axis", 0)
         kwargs.pop("_level", None)
 
@@ -537,13 +626,27 @@ class BasePandasDataset(object):
         # Dictionaries have complex behavior because they can be renamed here.
         elif func is None or isinstance(func, dict):
             return self._default_to_pandas("agg", func, *args, **kwargs)
-        elif is_list_like(func) or callable(func):
-            kwargs.pop("is_transform", None)
-            return self.apply(func, axis=_axis, args=args, **kwargs)
-        else:
-            raise TypeError("type {} is not callable".format(type(func)))
+        kwargs.pop("is_transform", None)
+        return self.apply(func, axis=_axis, args=args, **kwargs)
 
     def _string_function(self, func, *args, **kwargs):
+        """
+        Execute a function identified by its string name.
+
+        Parameters
+        ----------
+        func : str
+            Function name to call on `self`.
+        *args : list
+            Positional arguments to pass to func.
+        **kwargs : dict
+            Keyword arguments to pass to func.
+
+        Returns
+        -------
+        object
+            Function result.
+        """
         assert isinstance(func, str)
         f = getattr(self, func, None)
         if f is not None:
@@ -560,6 +663,15 @@ class BasePandasDataset(object):
         raise ValueError("{} is an unknown string function".format(func))
 
     def _get_dtypes(self):
+        """
+        Get dtypes as list.
+
+        Returns
+        -------
+        list
+            Either a one-element list that contains `dtype` if object denotes a Series
+            or a list that contains `dtypes` if object denotes a DataFrame.
+        """
         if hasattr(self, "dtype"):
             return [self.dtype]
         else:
@@ -633,6 +745,8 @@ class BasePandasDataset(object):
                 raise ValueError("Must specify 'axis' when aggregating by level")
             else:
                 result = self._reduce_dimension(
+                    # FIXME: Judging by pandas docs `**kwargs` serves only compatibility
+                    # purpose and does not affect the result, we shouldn't pass them to the query compiler.
                     self._query_compiler.all(
                         axis=0,
                         bool_only=bool_only,
@@ -714,6 +828,14 @@ class BasePandasDataset(object):
         args=(),
         **kwds,
     ):
+        def error_raiser(msg, exception):
+            """Convert passed exception to the same type as pandas do and raise it."""
+            # HACK: to concord with pandas error types by replacing all of the
+            # TypeErrors to the AssertionErrors
+            exception = exception if exception is not TypeError else AssertionError
+            raise exception(msg)
+
+        self._validate_function(func, on_invalid=error_raiser)
         axis = self._get_axis_number(axis)
         ErrorMessage.non_verified_udf()
         if isinstance(func, str):
@@ -726,19 +848,12 @@ class BasePandasDataset(object):
                 return result._query_compiler
             return result
         elif isinstance(func, dict):
-            if axis == 1:
-                raise TypeError(
-                    "(\"'dict' object is not callable\", "
-                    "'occurred at index {0}'".format(self.index[0])
-                )
             if len(self.columns) != len(set(self.columns)):
                 warnings.warn(
                     "duplicate column names not supported with apply().",
                     FutureWarning,
                     stacklevel=2,
                 )
-        elif not callable(func) and not is_list_like(func):
-            raise TypeError("{} object is not callable".format(type(func)))
         query_compiler = self._query_compiler.apply(
             func,
             axis,
@@ -869,6 +984,8 @@ class BasePandasDataset(object):
             lower = None
         if upper is not None and np.any(np.isnan(upper)):
             upper = None
+        # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
+        # purpose and does not affect the result, we shouldn't pass them to the query compiler.
         new_query_compiler = self._query_compiler.clip(
             lower=lower, upper=upper, axis=axis, inplace=inplace, *args, **kwargs
         )
@@ -908,6 +1025,8 @@ class BasePandasDataset(object):
         if axis == 1:
             self._validate_dtypes(numeric_only=True)
         return self.__constructor__(
+            # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
+            # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cummax(
                 axis=axis, skipna=skipna, **kwargs
             )
@@ -918,6 +1037,8 @@ class BasePandasDataset(object):
         if axis == 1:
             self._validate_dtypes(numeric_only=True)
         return self.__constructor__(
+            # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
+            # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cummin(
                 axis=axis, skipna=skipna, **kwargs
             )
@@ -927,6 +1048,8 @@ class BasePandasDataset(object):
         axis = self._get_axis_number(axis)
         self._validate_dtypes(numeric_only=True)
         return self.__constructor__(
+            # FIXME: Judging by pandas docs `**kwargs` serves only compatibility
+            # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cumprod(
                 axis=axis, skipna=skipna, **kwargs
             )
@@ -936,6 +1059,8 @@ class BasePandasDataset(object):
         axis = self._get_axis_number(axis)
         self._validate_dtypes(numeric_only=True)
         return self.__constructor__(
+            # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
+            # purpose and does not affect the result, we shouldn't pass them to the query compiler.
             query_compiler=self._query_compiler.cumsum(
                 axis=axis, skipna=skipna, **kwargs
             )
@@ -1169,9 +1294,13 @@ class BasePandasDataset(object):
             times=times,
         )
 
-    def expanding(self, min_periods=1, center=None, axis=0):
+    def expanding(self, min_periods=1, center=None, axis=0, method="single"):
         return self._default_to_pandas(
-            "expanding", min_periods=min_periods, center=center, axis=axis
+            "expanding",
+            min_periods=min_periods,
+            center=center,
+            axis=axis,
+            method=method,
         )
 
     def ffill(self, axis=None, inplace=False, limit=None, downcast=None):
@@ -1181,8 +1310,10 @@ class BasePandasDataset(object):
 
     pad = ffill
 
-    def fillna(
+    def _fillna(
         self,
+        squeeze_self,
+        squeeze_value,
         value=None,
         method=None,
         axis=None,
@@ -1190,18 +1321,50 @@ class BasePandasDataset(object):
         limit=None,
         downcast=None,
     ):
-        # TODO implement value passed as DataFrame/Series
-        if isinstance(value, BasePandasDataset):
-            new_query_compiler = self._default_to_pandas(
-                "fillna",
-                value=value,
-                method=method,
-                axis=axis,
-                inplace=False,
-                limit=limit,
-                downcast=downcast,
-            )._query_compiler
-            return self._create_or_update_from_compiler(new_query_compiler, inplace)
+        """
+        Fill NA/NaN values using the specified method.
+
+        Parameters
+        ----------
+        squeeze_self : bool
+            If True then self contains a Series object, if False then self contains
+            a DataFrame object.
+        squeeze_value : bool
+            If True then value contains a Series object, if False then value contains
+            a DataFrame object.
+        value : scalar, dict, Series, or DataFrame, default: None
+            Value to use to fill holes (e.g. 0), alternately a
+            dict/Series/DataFrame of values specifying which value to use for
+            each index (for a Series) or column (for a DataFrame).  Values not
+            in the dict/Series/DataFrame will not be filled. This value cannot
+            be a list.
+        method : {'backfill', 'bfill', 'pad', 'ffill', None}, default: None
+            Method to use for filling holes in reindexed Series
+            pad / ffill: propagate last valid observation forward to next valid
+            backfill / bfill: use next valid observation to fill gap.
+        axis : {None, 0, 1}, default: None
+            Axis along which to fill missing values.
+        inplace : bool, default: False
+            If True, fill in-place. Note: this will modify any
+            other views on this object (e.g., a no-copy slice for a column in a
+            DataFrame).
+        limit : int, default: None
+            If method is specified, this is the maximum number of consecutive
+            NaN values to forward/backward fill. In other words, if there is
+            a gap with more than this number of consecutive NaNs, it will only
+            be partially filled. If method is not specified, this is the
+            maximum number of entries along the entire axis where NaNs will be
+            filled. Must be greater than 0 if not None.
+        downcast : dict, default: None
+            A dict of item->dtype of what to downcast if possible,
+            or the string 'infer' which will try to downcast to an appropriate
+            equal type (e.g. float64 to int64 if possible).
+
+        Returns
+        -------
+        Series, DataFrame or None
+            Object with missing values filled or None if ``inplace=True``.
+        """
         inplace = validate_bool_kwarg(inplace, "inplace")
         axis = self._get_axis_number(axis)
         if isinstance(value, (list, tuple)):
@@ -1225,7 +1388,12 @@ class BasePandasDataset(object):
             elif limit <= 0:
                 raise ValueError("Limit must be greater than 0")
 
+        if isinstance(value, BasePandasDataset):
+            value = value._query_compiler
+
         new_query_compiler = self._query_compiler.fillna(
+            squeeze_self=squeeze_self,
+            squeeze_value=squeeze_value,
             value=value,
             method=method,
             axis=axis,
@@ -1353,6 +1521,8 @@ class BasePandasDataset(object):
 
     def kurt(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
         axis = self._get_axis_number(axis)
+        if skipna is None:
+            skipna = True
         if level is not None:
             func_kwargs = {
                 "skipna": skipna,
@@ -1405,7 +1575,8 @@ class BasePandasDataset(object):
 
     def mad(self, axis=None, skipna=None, level=None):
         axis = self._get_axis_number(axis)
-
+        if skipna is None:
+            skipna = True
         if level is not None:
             if (
                 not self._query_compiler.has_multiindex(axis=axis)
@@ -1428,7 +1599,7 @@ class BasePandasDataset(object):
         axis=None,
         level=None,
         errors="raise",
-        try_cast=False,
+        try_cast=no_default,
     ):
         return self._default_to_pandas(
             "mask",
@@ -1442,6 +1613,8 @@ class BasePandasDataset(object):
         )
 
     def max(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
+        if skipna is None:
+            skipna = True
         if level is not None:
             return self._default_to_pandas(
                 "max",
@@ -1477,26 +1650,32 @@ class BasePandasDataset(object):
 
         Parameters
         ----------
-        op_name: str,
+        op_name : str
             Name of method to apply.
-        axis: int or axis name,
+        axis : int or str
             Axis to apply method on.
-        skipna: bool,
+        skipna : bool
             Exclude NA/null values when computing the result.
-        level: int or level name,
+        level : int or str
             If specified `axis` is a MultiIndex, applying method along a particular
-            level, collapsing into a Series
-        numeric_only: bool
+            level, collapsing into a Series.
+        numeric_only : bool, optional
             Include only float, int, boolean columns. If None, will attempt
             to use everything, then use only numeric data.
+        **kwargs : dict
+            Additional keyword arguments to pass to `op_name`.
 
         Returns
         -------
-        In case of Series: scalar or Series (if level specified)
-        In case of DataFrame: Series of DataFrame (if level specified)
-
+        scalar, Series or DataFrame
+            `scalar` - self is Series and level is not specified.
+            `Series` - self is Series and level is specified, or
+                self is DataFrame and level is not specified.
+            `DataFrame` - self is DataFrame and level is specified.
         """
         axis = self._get_axis_number(axis)
+        if skipna is None:
+            skipna = True
         if level is not None:
             return self._default_to_pandas(
                 op_name,
@@ -1547,6 +1726,8 @@ class BasePandasDataset(object):
         )
 
     def min(self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs):
+        if skipna is None:
+            skipna = True
         if level is not None:
             return self._default_to_pandas(
                 "min",
@@ -1855,7 +2036,7 @@ class BasePandasDataset(object):
         self, level=None, drop=False, inplace=False, col_level=0, col_fill=""
     ):
         inplace = validate_bool_kwarg(inplace, "inplace")
-        # Error checking for matching Pandas. Pandas does not allow you to
+        # Error checking for matching pandas. Pandas does not allow you to
         # insert a dropped index into a DataFrame if these columns already
         # exist.
         if (
@@ -1894,6 +2075,7 @@ class BasePandasDataset(object):
         on=None,
         axis=0,
         closed=None,
+        method="single",
     ):
         if win_type is not None:
             return Window(
@@ -1905,6 +2087,7 @@ class BasePandasDataset(object):
                 on=on,
                 axis=axis,
                 closed=closed,
+                method=method,
             )
 
         return Rolling(
@@ -1916,9 +2099,12 @@ class BasePandasDataset(object):
             on=on,
             axis=axis,
             closed=closed,
+            method=method,
         )
 
     def round(self, decimals=0, *args, **kwargs):
+        # FIXME: Judging by pandas docs `*args` and `**kwargs` serves only compatibility
+        # purpose and does not affect the result, we shouldn't pass them to the query compiler.
         return self.__constructor__(
             query_compiler=self._query_compiler.round(decimals=decimals, **kwargs)
         )
@@ -1948,6 +2134,7 @@ class BasePandasDataset(object):
         weights=None,
         random_state=None,
         axis=None,
+        ignore_index=False,
     ):
         axis = self._get_axis_number(axis)
         if axis:
@@ -2001,7 +2188,7 @@ class BasePandasDataset(object):
 
         if n is None and frac is None:
             # default to n = 1 if n and frac are both None (in accordance with
-            # Pandas specification)
+            # pandas specification)
             n = 1
         elif n is not None and frac is None and n % 1 != 0:
             # n must be an integer
@@ -2028,6 +2215,7 @@ class BasePandasDataset(object):
                 weights=weights,
                 random_state=random_state,
                 axis=axis,
+                ignore_index=ignore_index,
             )
         if random_state is not None:
             # Get a random number generator depending on the type of
@@ -2150,20 +2338,15 @@ class BasePandasDataset(object):
 
         if freq is None:
             if axis == "index" or axis == 0:
-                if periods > 0:
-                    dropped_df = self.drop(self.index[-periods:])
-                    new_frame = filled_df.append(dropped_df, ignore_index=True)
-                    new_frame.index = self.index.copy()
-                    if isinstance(self, DataFrame):
-                        new_frame.columns = self.columns.copy()
-                    return new_frame
-                else:
-                    dropped_df = self.drop(self.index[:-periods])
-                    new_frame = dropped_df.append(filled_df, ignore_index=True)
-                    new_frame.index = self.index.copy()
-                    if isinstance(self, DataFrame):
-                        new_frame.columns = self.columns.copy()
-                    return new_frame
+                new_frame = (
+                    filled_df.append(self.iloc[:-periods], ignore_index=True)
+                    if periods > 0
+                    else self.iloc[-periods:].append(filled_df, ignore_index=True)
+                )
+                new_frame.index = self.index.copy()
+                if isinstance(self, DataFrame):
+                    new_frame.columns = self.columns.copy()
+                return new_frame
             else:
                 if not isinstance(self, DataFrame):
                     raise ValueError(
@@ -2345,9 +2528,9 @@ class BasePandasDataset(object):
         }
         new_query_compiler = self._query_compiler
 
-        from modin.data_management.factories.dispatcher import EngineDispatcher
+        from modin.data_management.factories.dispatcher import FactoryDispatcher
 
-        return EngineDispatcher.to_csv(new_query_compiler, **kwargs)
+        return FactoryDispatcher.to_csv(new_query_compiler, **kwargs)
 
     def to_dict(self, orient="dict", into=dict):  # pragma: no cover
         return self._default_to_pandas("to_dict", orient=orient, into=into)
@@ -2509,13 +2692,15 @@ class BasePandasDataset(object):
 
     def to_pickle(
         self,
-        path,
-        compression="infer",
-        protocol=pkl.HIGHEST_PROTOCOL,
+        path: FilePathOrBuffer,
+        compression: CompressionOptions = "infer",
+        protocol: int = pkl.HIGHEST_PROTOCOL,
         storage_options: StorageOptions = None,
     ):  # pragma: no cover
-        return self._default_to_pandas(
-            "to_pickle",
+        from modin.pandas.io import to_pickle
+
+        to_pickle(
+            self,
             path,
             compression=compression,
             protocol=protocol,
@@ -2587,9 +2772,9 @@ class BasePandasDataset(object):
             # so pandas._to_sql will not write the index to the database as well
             index = False
 
-        from modin.data_management.factories.dispatcher import EngineDispatcher
+        from modin.data_management.factories.dispatcher import FactoryDispatcher
 
-        EngineDispatcher.to_sql(
+        FactoryDispatcher.to_sql(
             new_query_compiler,
             name=name,
             con=con,
@@ -2636,10 +2821,13 @@ class BasePandasDataset(object):
 
     def transform(self, func, axis=0, *args, **kwargs):
         kwargs["is_transform"] = True
+        self._validate_function(func)
         try:
             result = self.agg(func, axis=axis, *args, **kwargs)
-        except Exception:
-            raise ValueError("Transform function failed")
+        except TypeError:
+            raise
+        except Exception as err:
+            raise ValueError("Transform function failed") from err
         try:
             assert len(result) == len(self)
         except Exception:
@@ -2720,7 +2908,7 @@ class BasePandasDataset(object):
         if not self._query_compiler.lazy_execution and len(self) == 0:
             return self._default_to_pandas("__getitem__", key)
         # see if we can slice the rows
-        # This lets us reuse code in Pandas to error check
+        # This lets us reuse code in pandas to error check
         indexer = None
         if isinstance(key, slice) or (
             isinstance(key, str)
@@ -2734,21 +2922,44 @@ class BasePandasDataset(object):
         else:
             return self._getitem(key)
 
+    def __hash__(self):
+        """
+        Raise an exception when calling hash on non-hashable ``DataFrame`` or ``Series`` objects.
+
+        Raises
+        ------
+        TypeError
+        """
+        raise TypeError(f"unhashable type: '{type(self).__name__}'")
+
     def _setitem_slice(self, key: slice, value):
         """
-        Set rows specified by 'key' slice with 'value'.
+        Set rows specified by `key` slice with `value`.
 
         Parameters
         ----------
-        key: location or index based slice,
+        key : location or index-based slice
             Key that points rows to modify.
-        value: any,
+        value : object
             Value to assing to the rows.
         """
         indexer = convert_to_index_sliceable(pandas.DataFrame(index=self.index), key)
         self.iloc[indexer] = value
 
     def _getitem_slice(self, key: slice):
+        """
+        Get rows specified by `key` slice.
+
+        Parameters
+        ----------
+        key : location or index-based slice
+            Key that points to rows to retrieve.
+
+        Returns
+        -------
+        modin.pandas.BasePandasDataset
+            Selected rows.
+        """
         if key.start is None and key.stop is None:
             return self.copy()
         return self.iloc[key]
@@ -2841,12 +3052,7 @@ if IsExperimental.get():
     make_wrapped_class(BasePandasDataset, "make_base_dataset_wrapper")
 
 
-@_inherit_docstrings(
-    pandas.core.resample.Resampler,
-    excluded=[
-        pandas.core.resample.Resampler.__init__,
-    ],
-)
+@_inherit_docstrings(pandas.core.resample.Resampler)
 class Resampler(object):
     def __init__(
         self,
@@ -2867,6 +3073,8 @@ class Resampler(object):
         self._dataframe = dataframe
         self._query_compiler = dataframe._query_compiler
         axis = self._dataframe._get_axis_number(axis)
+        # FIXME: this should be converted into a dict to ensure simplicity
+        # of handling resample parameters at the backend level.
         self.resample_args = [
             rule,
             axis,
@@ -3218,12 +3426,7 @@ class Resampler(object):
         )
 
 
-@_inherit_docstrings(
-    pandas.core.window.rolling.Window,
-    excluded=[
-        pandas.core.window.rolling.Window.__init__,
-    ],
-)
+@_inherit_docstrings(pandas.core.window.rolling.Window)
 class Window(object):
     def __init__(
         self,
@@ -3235,6 +3438,7 @@ class Window(object):
         on=None,
         axis=0,
         closed=None,
+        method="single",
     ):
         self._dataframe = dataframe
         self._query_compiler = dataframe._query_compiler
@@ -3246,6 +3450,7 @@ class Window(object):
             on,
             axis,
             closed,
+            method,
         ]
 
     def mean(self, *args, **kwargs):
@@ -3294,6 +3499,7 @@ class Rolling(object):
         on=None,
         axis=0,
         closed=None,
+        method="single",
     ):
         self._dataframe = dataframe
         self._query_compiler = dataframe._query_compiler
@@ -3305,6 +3511,7 @@ class Rolling(object):
             on,
             axis,
             closed,
+            method,
         ]
 
     def count(self):

@@ -11,6 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""IO functions implementations."""
+
 from modin.engines.base.io.io import BaseIO
 from modin.engines.base.io.text.csv_dispatcher import CSVDispatcher
 from modin.engines.base.io.text.csv_glob_dispatcher import CSVGlobDispatcher
@@ -23,6 +25,7 @@ from modin.engines.base.io.column_stores.parquet_dispatcher import ParquetDispat
 from modin.engines.base.io.column_stores.hdf_dispatcher import HDFDispatcher
 from modin.engines.base.io.column_stores.feather_dispatcher import FeatherDispatcher
 from modin.engines.base.io.sql.sql_dispatcher import SQLDispatcher
+from modin.engines.base.io.pickle.pickle_dispatcher import PickleExperimentalDispatcher
 
 __all__ = [
     "BaseIO",
@@ -37,4 +40,5 @@ __all__ = [
     "FeatherDispatcher",
     "SQLDispatcher",
     "ExcelDispatcher",
+    "PickleExperimentalDispatcher",
 ]

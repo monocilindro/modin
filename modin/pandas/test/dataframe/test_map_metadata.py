@@ -1239,11 +1239,9 @@ def test___invert__(data):
 
 def test___hash__():
     data = test_data_values[0]
-    with pytest.warns(UserWarning):
-        try:
-            pd.DataFrame(data).__hash__()
-        except TypeError:
-            pass
+    pandas_df = pandas.DataFrame(data)
+    modin_df = pd.DataFrame(data)
+    eval_general(modin_df, pandas_df, lambda df: hash(df))
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)

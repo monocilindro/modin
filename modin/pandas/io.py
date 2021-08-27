@@ -12,13 +12,10 @@
 # governing permissions and limitations under the License.
 
 """
-Implement I/O public API as Pandas does.
+Implement I/O public API as pandas does.
 
-Almost all docstrings for public and magic methods should be inherited from Pandas
-for better maintability. So some codes are ignored in pydocstyle check:
-    - D101: missing docstring in class
-    - D103: missing docstring in public function
-    - D105: missing docstring in magic method
+Almost all docstrings for public and magic methods should be inherited from pandas
+for better maintability.
 Manually add documentation for methods which are not presented in pandas.
 """
 
@@ -29,12 +26,12 @@ import pandas._libs.lib as lib
 import pathlib
 import re
 from collections import OrderedDict
-from pandas._typing import FilePathOrBuffer, StorageOptions
+from pandas._typing import CompressionOptions, FilePathOrBuffer, StorageOptions
 from typing import Union, IO, AnyStr, Sequence, Dict, List, Optional, Any
 
 from modin.error_message import ErrorMessage
 from .dataframe import DataFrame
-from modin.utils import _inherit_func_docstring, _inherit_docstrings, Engine
+from modin.utils import _inherit_docstrings, Engine
 from . import _update_engine
 
 PQ_INDEX_REGEX = re.compile(r"__index_level_\d+__")
@@ -49,15 +46,17 @@ def _read(**kwargs):
 
     Parameters
     ----------
-    filepath_or_buffer:
-        The filepath of the csv file.
-        We only support local files for now.
-    kwargs: Keyword arguments in pandas.read_csv
+    **kwargs : dict
+        Keyword arguments in pandas.read_csv.
+
+    Returns
+    -------
+    modin.pandas.DataFrame
     """
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    pd_obj = EngineDispatcher.read_csv(**kwargs)
+    pd_obj = FactoryDispatcher.read_csv(**kwargs)
     # This happens when `read_csv` returns a TextFileReader object for iterating through
     if isinstance(pd_obj, pandas.io.parsers.TextFileReader):
         reader = pd_obj.read
@@ -68,17 +67,17 @@ def _read(**kwargs):
     return DataFrame(query_compiler=pd_obj)
 
 
-@_inherit_func_docstring(pandas.read_csv)
+@_inherit_docstrings(pandas.read_csv)
 def read_csv(
     filepath_or_buffer: Union[str, pathlib.Path, IO[AnyStr]],
     sep=lib.no_default,
     delimiter=None,
     header="infer",
-    names=None,
+    names=lib.no_default,
     index_col=None,
     usecols=None,
     squeeze=False,
-    prefix=None,
+    prefix=lib.no_default,
     mangle_dupe_cols=True,
     dtype=None,
     engine=None,
@@ -110,9 +109,11 @@ def read_csv(
     escapechar=None,
     comment=None,
     encoding=None,
+    encoding_errors="strict",
     dialect=None,
-    error_bad_lines=True,
-    warn_bad_lines=True,
+    error_bad_lines=None,
+    warn_bad_lines=None,
+    on_bad_lines=None,
     skipfooter=0,
     doublequote=True,
     delim_whitespace=False,
@@ -126,25 +127,21 @@ def read_csv(
         val.name for val in inspect.signature(pandas.read_csv).parameters.values()
     }
     _, _, _, f_locals = inspect.getargvalues(inspect.currentframe())
-    if f_locals.get("sep", sep) is lib.no_default:
-        f_locals["sep"] = ","
-    elif f_locals.get("sep", sep) is False:
-        f_locals["sep"] = "\t"
     kwargs = {k: v for k, v in f_locals.items() if k in _pd_read_csv_signature}
     return _read(**kwargs)
 
 
-@_inherit_func_docstring(pandas.read_table)
+@_inherit_docstrings(pandas.read_table)
 def read_table(
     filepath_or_buffer: Union[str, pathlib.Path, IO[AnyStr]],
     sep=lib.no_default,
     delimiter=None,
     header="infer",
-    names=None,
+    names=lib.no_default,
     index_col=None,
     usecols=None,
     squeeze=False,
-    prefix=None,
+    prefix=lib.no_default,
     mangle_dupe_cols=True,
     dtype=None,
     engine=None,
@@ -176,9 +173,11 @@ def read_table(
     escapechar=None,
     comment=None,
     encoding=None,
+    encoding_errors="strict",
     dialect=None,
-    error_bad_lines=True,
-    warn_bad_lines=True,
+    error_bad_lines=None,
+    warn_bad_lines=None,
+    on_bad_lines=None,
     skipfooter=0,
     doublequote=True,
     delim_whitespace=False,
@@ -197,29 +196,31 @@ def read_table(
     return _read(**kwargs)
 
 
-@_inherit_func_docstring(pandas.read_parquet)
+@_inherit_docstrings(pandas.read_parquet)
 def read_parquet(
     path,
     engine: str = "auto",
     columns=None,
+    storage_options: StorageOptions = None,
     use_nullable_dtypes: bool = False,
     **kwargs,
 ):
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
     return DataFrame(
-        query_compiler=EngineDispatcher.read_parquet(
+        query_compiler=FactoryDispatcher.read_parquet(
             path=path,
-            columns=columns,
             engine=engine,
+            columns=columns,
+            storage_options=storage_options,
             use_nullable_dtypes=use_nullable_dtypes,
             **kwargs,
         )
     )
 
 
-@_inherit_func_docstring(pandas.read_json)
+@_inherit_docstrings(pandas.read_json)
 def read_json(
     path_or_buf=None,
     orient=None,
@@ -232,6 +233,7 @@ def read_json(
     precise_float=False,
     date_unit=None,
     encoding=None,
+    encoding_errors="strict",
     lines=False,
     chunksize=None,
     compression="infer",
@@ -240,13 +242,13 @@ def read_json(
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_json(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_json(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_gbq)
+@_inherit_docstrings(pandas.read_gbq)
 def read_gbq(
     query: str,
     project_id: Optional[str] = None,
@@ -265,13 +267,13 @@ def read_gbq(
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
     kwargs.update(kwargs.pop("kwargs", {}))
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_gbq(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_gbq(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_html)
+@_inherit_docstrings(pandas.read_html)
 def read_html(
     io,
     match=".+",
@@ -291,24 +293,24 @@ def read_html(
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_html(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_html(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_clipboard)
+@_inherit_docstrings(pandas.read_clipboard)
 def read_clipboard(sep=r"\s+", **kwargs):  # pragma: no cover
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
     kwargs.update(kwargs.pop("kwargs", {}))
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_clipboard(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_clipboard(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_excel)
+@_inherit_docstrings(pandas.read_excel)
 def read_excel(
     io,
     sheet_name=0,
@@ -333,16 +335,16 @@ def read_excel(
     thousands=None,
     comment=None,
     skipfooter=0,
-    convert_float=True,
+    convert_float=None,
     mangle_dupe_cols=True,
     storage_options: StorageOptions = None,
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    intermediate = EngineDispatcher.read_excel(**kwargs)
+    intermediate = FactoryDispatcher.read_excel(**kwargs)
     if isinstance(intermediate, (OrderedDict, dict)):
         parsed = type(intermediate)()
         for key in intermediate.keys():
@@ -352,7 +354,7 @@ def read_excel(
         return DataFrame(query_compiler=intermediate)
 
 
-@_inherit_func_docstring(pandas.read_hdf)
+@_inherit_docstrings(pandas.read_hdf)
 def read_hdf(
     path_or_buf,
     key=None,
@@ -369,13 +371,13 @@ def read_hdf(
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
     kwargs.update(kwargs.pop("kwargs", {}))
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_hdf(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_hdf(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_feather)
+@_inherit_docstrings(pandas.read_feather)
 def read_feather(
     path,
     columns=None,
@@ -384,13 +386,13 @@ def read_feather(
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_feather(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_feather(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_stata)
+@_inherit_docstrings(pandas.read_stata)
 def read_stata(
     filepath_or_buffer,
     convert_dates=True,
@@ -402,17 +404,18 @@ def read_stata(
     order_categoricals=True,
     chunksize=None,
     iterator=False,
+    compression="infer",
     storage_options: StorageOptions = None,
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_stata(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_stata(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_sas)
+@_inherit_docstrings(pandas.read_sas)
 def read_sas(
     filepath_or_buffer,
     format=None,
@@ -423,13 +426,13 @@ def read_sas(
 ):  # pragma: no cover
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_sas(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_sas(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_pickle)
+@_inherit_docstrings(pandas.read_pickle)
 def read_pickle(
     filepath_or_buffer: FilePathOrBuffer,
     compression: Optional[str] = "infer",
@@ -437,13 +440,13 @@ def read_pickle(
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_pickle(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_pickle(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_sql)
+@_inherit_docstrings(pandas.read_sql)
 def read_sql(
     sql,
     con,
@@ -456,19 +459,19 @@ def read_sql(
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
     if kwargs.get("chunksize") is not None:
         ErrorMessage.default_to_pandas("Parameters provided [chunksize]")
         df_gen = pandas.read_sql(**kwargs)
         return (
-            DataFrame(query_compiler=EngineDispatcher.from_pandas(df)) for df in df_gen
+            DataFrame(query_compiler=FactoryDispatcher.from_pandas(df)) for df in df_gen
         )
-    return DataFrame(query_compiler=EngineDispatcher.read_sql(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_sql(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_fwf)
+@_inherit_docstrings(pandas.read_fwf)
 def read_fwf(
     filepath_or_buffer: Union[str, pathlib.Path, IO[AnyStr]],
     colspecs="infer",
@@ -476,12 +479,12 @@ def read_fwf(
     infer_nrows=100,
     **kwds,
 ):
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
     kwargs.update(kwargs.pop("kwds", {}))
-    pd_obj = EngineDispatcher.read_fwf(**kwargs)
+    pd_obj = FactoryDispatcher.read_fwf(**kwargs)
     # When `read_fwf` returns a TextFileReader object for iterating through
     if isinstance(pd_obj, pandas.io.parsers.TextFileReader):
         reader = pd_obj.read
@@ -492,7 +495,7 @@ def read_fwf(
     return DataFrame(query_compiler=pd_obj)
 
 
-@_inherit_func_docstring(pandas.read_sql_table)
+@_inherit_docstrings(pandas.read_sql_table)
 def read_sql_table(
     table_name,
     con,
@@ -505,13 +508,13 @@ def read_sql_table(
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_sql_table(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_sql_table(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_sql_query)
+@_inherit_docstrings(pandas.read_sql_query)
 def read_sql_query(
     sql,
     con,
@@ -520,48 +523,53 @@ def read_sql_query(
     params=None,
     parse_dates=None,
     chunksize=None,
+    dtype=None,
 ):
     _, _, _, kwargs = inspect.getargvalues(inspect.currentframe())
 
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
-    return DataFrame(query_compiler=EngineDispatcher.read_sql_query(**kwargs))
+    return DataFrame(query_compiler=FactoryDispatcher.read_sql_query(**kwargs))
 
 
-@_inherit_func_docstring(pandas.read_spss)
+@_inherit_docstrings(pandas.read_spss)
 def read_spss(
     path: Union[str, pathlib.Path],
     usecols: Union[Sequence[str], type(None)] = None,
     convert_categoricals: bool = True,
 ):
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
     return DataFrame(
-        query_compiler=EngineDispatcher.read_spss(path, usecols, convert_categoricals)
+        query_compiler=FactoryDispatcher.read_spss(path, usecols, convert_categoricals)
     )
 
 
-@_inherit_func_docstring(pandas.to_pickle)
+@_inherit_docstrings(pandas.to_pickle)
 def to_pickle(
     obj: Any,
-    filepath_or_buffer: Union[str, pathlib.Path],
-    compression: Optional[str] = "infer",
+    filepath_or_buffer: FilePathOrBuffer,
+    compression: CompressionOptions = "infer",
     protocol: int = pickle.HIGHEST_PROTOCOL,
     storage_options: StorageOptions = None,
 ):
-    from modin.data_management.factories.dispatcher import EngineDispatcher
+    from modin.data_management.factories.dispatcher import FactoryDispatcher
 
     Engine.subscribe(_update_engine)
     if isinstance(obj, DataFrame):
         obj = obj._query_compiler
-    return EngineDispatcher.to_pickle(
-        obj, filepath_or_buffer, compression=compression, protocol=protocol
+    return FactoryDispatcher.to_pickle(
+        obj,
+        filepath_or_buffer=filepath_or_buffer,
+        compression=compression,
+        protocol=protocol,
+        storage_options=storage_options,
     )
 
 
-@_inherit_func_docstring(pandas.json_normalize)
+@_inherit_docstrings(pandas.json_normalize)
 def json_normalize(
     data: Union[Dict, List[Dict]],
     record_path: Optional[Union[str, List]] = None,
@@ -581,13 +589,46 @@ def json_normalize(
     )
 
 
-@_inherit_func_docstring(pandas.read_orc)
+@_inherit_docstrings(pandas.read_orc)
 def read_orc(
     path: FilePathOrBuffer, columns: Optional[List[str]] = None, **kwargs
 ) -> DataFrame:
     ErrorMessage.default_to_pandas("read_orc")
     Engine.subscribe(_update_engine)
     return DataFrame(pandas.read_orc(path, columns, **kwargs))
+
+
+@_inherit_docstrings(pandas.read_xml)
+def read_xml(
+    path_or_buffer,
+    xpath="./*",
+    namespaces=None,
+    elems_only=False,
+    attrs_only=False,
+    names=None,
+    encoding="utf-8",
+    parser="lxml",
+    stylesheet=None,
+    compression="infer",
+    storage_options=None,
+) -> DataFrame:
+    ErrorMessage.default_to_pandas("read_xml")
+    Engine.subscribe(_update_engine)
+    return DataFrame(
+        pandas.read_xml(
+            path_or_buffer,
+            xpath=xpath,
+            namespaces=namespaces,
+            elems_only=elems_only,
+            attrs_only=attrs_only,
+            names=names,
+            encoding=encoding,
+            parser=parser,
+            stylesheet=stylesheet,
+            compression=compression,
+            storage_options=storage_options,
+        )
+    )
 
 
 @_inherit_docstrings(pandas.HDFStore)

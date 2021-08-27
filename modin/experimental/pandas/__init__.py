@@ -11,6 +11,27 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""
+The main module through which interaction with the experimental API takes place.
+
+See `Experimental API Reference` for details.
+
+Notes
+-----
+* Some of experimental APIs deviate from pandas in order to provide improved
+  performance.
+
+* Although the use of experimental backends and engines is available through the
+  `modin.pandas` module when defining environment variable `MODIN_EXPERIMENTAL=true`,
+  the use of experimental I/O functions is available only through the
+  `modin.experimental.pandas` module.
+
+Examples
+--------
+>>> import modin.experimental.pandas as pd
+>>> df = pd.read_csv_glob("data*.csv")
+"""
+
 from modin.config import IsExperimental
 
 IsExperimental.put(True)
@@ -19,9 +40,15 @@ IsExperimental.put(True)
 # in the user code
 from .numpy_wrap import _CAUGHT_NUMPY  # noqa F401
 from modin.pandas import *  # noqa F401, F403
-from .io_exp import read_sql, read_csv_glob  # noqa F401
+from .io_exp import (  # noqa F401
+    read_sql,
+    read_csv_glob,
+    read_pickle_distributed,
+    to_pickle_distributed,
+)
 import warnings
 
+setattr(DataFrame, "to_pickle_distributed", to_pickle_distributed)  # noqa: F405
 
 warnings.warn(
     "Thank you for using the Modin Experimental pandas API."

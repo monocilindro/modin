@@ -466,6 +466,27 @@ def df_categories_equals(df1, df2):
         )
 
 
+def assert_empty_frame_equal(df1, df2):
+    """
+    Test if df1 and df2 are empty.
+
+    Parameters
+    ----------
+    df1 : pandas.DataFrame or pandas.Series
+    df2 : pandas.DataFrame or pandas.Series
+
+    Raises
+    ------
+    AssertionError
+        If check fails.
+    """
+
+    if (df1.empty and not df2.empty) or (df2.empty and not df1.empty):
+        assert False, "One of the passed frames is empty, when other isn't"
+    elif df1.empty and df2.empty and type(df1) != type(df2):
+        assert False, f"Empty frames have different types: {type(df1)} != {type(df2)}"
+
+
 def df_equals(df1, df2):
     """Tests if df1 and df2 are equal.
 
@@ -516,12 +537,7 @@ def df_equals(df1, df2):
         df2 = to_pandas(df2)
 
     if isinstance(df1, pandas.DataFrame) and isinstance(df2, pandas.DataFrame):
-        if (df1.empty and not df2.empty) or (df2.empty and not df1.empty):
-            assert False, "One of the passed frames is empty, when other isn't"
-        elif df1.empty and df2.empty and type(df1) != type(df2):
-            assert (
-                False
-            ), f"Empty frames have different types: {type(df1)} != {type(df2)}"
+        assert_empty_frame_equal(df1, df2)
 
     if isinstance(df1, pandas.DataFrame) and isinstance(df2, pandas.DataFrame):
         assert_frame_equal(
@@ -682,7 +698,7 @@ def eval_general(
                     ), f"not acceptable exception type: {md_e.value}"
         else:
             md_result = fn(modin_df, **md_kwargs)
-            return (md_result, pd_result) if not __inplace__ else (modin_df, pandas_df)
+            return (md_result, pd_result) if not inplace else (modin_df, pandas_df)
 
     for key, value in kwargs.items():
         if check_kwargs_callable and callable(value):
@@ -1243,3 +1259,13 @@ def sort_index_for_equal_values(series, ascending=False):
         res.index = res.index.droplevel(0)
     res.name = series.name
     return res
+
+
+def rotate_decimal_digits_or_symbols(value):
+    if value.dtype == object:
+        # When dtype is object, we assume that it is actually strings from MultiIndex level names
+        return [x[-1] + x[:-1] for x in value]
+    else:
+        tens = value // 10
+        ones = value % 10
+        return tens + ones * 10

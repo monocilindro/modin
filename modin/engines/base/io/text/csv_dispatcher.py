@@ -11,6 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module houses `CSVDispatcher` class, that is used for reading `.csv` files."""
+
 from modin.engines.base.io.text.text_file_dispatcher import (
     TextFileDispatcher,
     ColumnNamesTypes,
@@ -20,6 +22,7 @@ from csv import QUOTE_NONE, Dialect
 import sys
 from typing import Union, Sequence, Callable, Dict, Tuple
 from pandas._typing import FilePathOrBuffer
+import pandas._libs.lib as lib
 
 from modin.config import NPartitions
 
@@ -30,8 +33,29 @@ IndexColType = Union[int, str, bool, Sequence[int], Sequence[str], None]
 
 
 class CSVDispatcher(TextFileDispatcher):
+    """
+    Class handles utils for reading `.csv` files.
+
+    Inherits some common for text files util functions from `TextFileDispatcher` class.
+    """
+
     @classmethod
     def _read(cls, filepath_or_buffer, **kwargs):
+        """
+        Read data from `filepath_or_buffer` according to `kwargs` parameters.
+
+        Parameters
+        ----------
+        filepath_or_buffer : str, path object or file-like object
+            `filepath_or_buffer` parameter of `read_csv` function.
+        **kwargs : dict
+            Parameters of `read_csv` function.
+
+        Returns
+        -------
+        new_query_compiler : BaseQueryCompiler
+            Query compiler with imported data for further processing.
+        """
         filepath_or_buffer_md = (
             cls.get_path(filepath_or_buffer)
             if isinstance(filepath_or_buffer, str)
@@ -47,14 +71,19 @@ class CSVDispatcher(TextFileDispatcher):
             return cls.single_worker_read(filepath_or_buffer, **kwargs)
 
         # Getting frequently used read_csv kwargs
-        names = kwargs.get("names", None)
+        names = kwargs.get("names", lib.no_default)
         index_col = kwargs.get("index_col", None)
         encoding = kwargs.get("encoding", None)
-        skiprows = kwargs.get("skiprows")
+        skiprows = kwargs.get("skiprows", None)
 
         is_quoting = kwargs.get("quoting", "") != QUOTE_NONE
         quotechar = kwargs.get("quotechar", '"').encode(
             encoding if encoding is not None else "UTF-8"
+        )
+        # In these cases we should pass additional metadata
+        # to the workers to match pandas output
+        pass_names = names in [None, lib.no_default] and (
+            skiprows is not None or kwargs.get("skipfooter", 0) != 0
         )
 
         # Define header size for further skipping (Header can be skipped because header
@@ -69,61 +98,30 @@ class CSVDispatcher(TextFileDispatcher):
         # simultaneously
         skiprows = skiprows + header_size if skiprows else header_size
 
-        # Now we need to define parameters, which are common for all partitions. These
-        # parameters can be `sniffed` from empty dataframes created further
-        if names is None:
-            # When reading the one row df, we assume no `index_col` to get the correct
-            # column names before we build the index. Because we pass `names` in, this
-            # step has to happen without removing the `index_col` otherwise it will not
-            # be assigned correctly
-            names = pandas.read_csv(
-                filepath_or_buffer,
-                **dict(kwargs, usecols=None, nrows=1, skipfooter=0, index_col=None),
-            ).columns
-        elif index_col is None and not kwargs.get("usecols", None):
-            # When names is set to some list that is smaller than the number of columns
-            # in the file, the first columns are built as a hierarchical index.
-            empty_pd_df = pandas.read_csv(
-                filepath_or_buffer, nrows=0, encoding=encoding
-            )
-            num_cols = len(empty_pd_df.columns)
-            if num_cols > len(names):
-                index_col = list(range(num_cols - len(names)))
-                if len(index_col) == 1:
-                    index_col = index_col[0]
         pd_df_metadata = pandas.read_csv(
             filepath_or_buffer,
             **dict(kwargs, nrows=1, skipfooter=0, index_col=index_col),
         )
         column_names = pd_df_metadata.columns
-
-        # Max number of partitions available
-        num_partitions = NPartitions.get()
-        # This is the number of splits for the columns
-        num_splits = min(len(column_names), num_partitions)
-        # Metadata definition
-        column_widths, num_splits = cls._define_metadata(
-            pd_df_metadata, num_splits, column_names
-        )
+        column_widths, num_splits = cls._define_metadata(pd_df_metadata, column_names)
 
         # kwargs that will be passed to the workers
         partition_kwargs = dict(
             kwargs,
             fname=filepath_or_buffer_md,
             num_splits=num_splits,
-            header=None,
-            names=names,
+            header_size=header_size if not pass_names else 0,
+            names=names if not pass_names else column_names,
             skipfooter=0,
-            skiprows=1 if encoding is not None else None,
+            skiprows=None,
             nrows=None,
             compression=compression_infered,
-            index_col=index_col,
         )
 
         with cls.file_open(filepath_or_buffer_md, "rb", compression_infered) as f:
             splits = cls.partitioned_file(
                 f,
-                num_partitions=num_partitions,
+                num_partitions=NPartitions.get(),
                 nrows=kwargs.get("nrows", None),
                 skiprows=skiprows,
                 quotechar=quotechar,
@@ -138,7 +136,7 @@ class CSVDispatcher(TextFileDispatcher):
             partition_ids=partition_ids,
             index_ids=index_ids,
             dtypes_ids=dtypes_ids,
-            index_col_md=index_col,
+            index_col=index_col,
             index_name=pd_df_metadata.index.name,
             column_widths=column_widths,
             column_names=column_names,
@@ -157,20 +155,21 @@ class CSVDispatcher(TextFileDispatcher):
         compression_infered: str,
     ) -> bool:
         """
-        Check whatever or not passed parameters are supported by current modin.read_csv
-        implementation.
+        Check if passed parameters are supported by current `read_csv` implementation.
+
+        Parameters
         ----------
-        filepath_or_buffer: str, path object or file-like object
-                `filepath_or_buffer` parameter of read_csv function.
-        read_csv_kwargs: ReadCsvKwargsType
-                Parameters of read_csv function.
-        compression_infered: str
-                Infered `compression` parameter of read_csv function.
+        filepath_or_buffer : str, path object or file-like object
+            `filepath_or_buffer` parameter of read_csv function.
+        read_csv_kwargs : dict
+            Parameters of read_csv function.
+        compression_infered : str
+            Inferred `compression` parameter of read_csv function.
 
         Returns
         -------
-        bool:
-            Whatever passed parameters are supported or not.
+        bool
+            Whether passed parameters are supported or not.
         """
         if isinstance(filepath_or_buffer, str):
             if not cls.file_exists(filepath_or_buffer):
@@ -201,33 +200,31 @@ class CSVDispatcher(TextFileDispatcher):
     def _define_index(
         cls,
         index_ids: list,
-        index_col: IndexColType,
         index_name: str,
     ) -> Tuple[IndexColType, list]:
         """
-        Compute the index based on a sum of the lengths of each partition
-        (by default) or based on the column(s) that were requested.
+        Compute the resulting DataFrame index and index lengths for each or partitions.
+
+        Parameters
         ----------
-        index_ids: list
-                Array with references to the partitions index objects.
-        index_col: IndexColType
-                index_col parameter of read_csv function.
-        index_name: str
-                Name that should be assigned to the index if `index_col`
-                is not provided.
+        index_ids : list
+            Array with references to the partitions index objects.
+        index_name : str
+            Name that should be assigned to the index if `index_col`
+            is not provided.
 
         Returns
         -------
-        new_index: IndexColType
-                Index that should be passed to the new_frame constructor.
-        row_lengths: list
-                Partitions rows lengths.
+        new_index : IndexColType
+            Index that should be passed to the new_frame constructor.
+        row_lengths : list
+            Partitions rows lengths.
         """
-        if index_col is None:
-            row_lengths = cls.materialize(index_ids)
-            new_index = pandas.RangeIndex(sum(row_lengths))
+        index_objs = cls.materialize(index_ids)
+        if len(index_objs) == 0 or isinstance(index_objs[0], int):
+            row_lengths = index_objs
+            new_index = pandas.RangeIndex(sum(index_objs))
         else:
-            index_objs = cls.materialize(index_ids)
             row_lengths = [len(o) for o in index_objs]
             new_index = index_objs[0].append(index_objs[1:])
             new_index.name = index_name
@@ -240,7 +237,7 @@ class CSVDispatcher(TextFileDispatcher):
         partition_ids: list,
         index_ids: list,
         dtypes_ids: list,
-        index_col_md: IndexColType,
+        index_col: IndexColType,
         index_name: str,
         column_widths: list,
         column_names: ColumnNamesTypes,
@@ -248,29 +245,33 @@ class CSVDispatcher(TextFileDispatcher):
     ):
         """
         Get new query compiler from data received from workers.
+
+        Parameters
         ----------
-        partition_ids: list
-                array with references to the partitions data.
-        index_ids: list
-                array with references to the partitions index objects.
-        dtypes_ids: list
-                array with references to the partitions dtypes objects.
-        index_col_md: IndexColType
-                `index_col` parameter passed to the workers.
-        index_name: str
-                Name that should be assigned to the index if `index_col`
-                is not provided.
-        column_widths: list
-                Number of columns in each partition.
-        column_names: ColumnNamesTypes
-                Array with columns names.
+        partition_ids : list
+            Array with references to the partitions data.
+        index_ids : list
+            Array with references to the partitions index objects.
+        dtypes_ids : list
+            Array with references to the partitions dtypes objects.
+        index_col : IndexColType
+            `index_col` parameter of `read_csv` function.
+        index_name : str
+            Name that should be assigned to the index if `index_col`
+            is not provided.
+        column_widths : list
+            Number of columns in each partition.
+        column_names : ColumnNamesTypes
+            Array with columns names.
+        **kwargs : dict
+            Parameters of `read_csv` function needed for postprocessing.
 
         Returns
         -------
-        new_query_compiler:
-                New query compiler, created from `new_frame`.
+        new_query_compiler : BaseQueryCompiler
+            New query compiler, created from `new_frame`.
         """
-        new_index, row_lengths = cls._define_index(index_ids, index_col_md, index_name)
+        new_index, row_lengths = cls._define_index(index_ids, index_name)
         # Compute dtypes by getting collecting and combining all of the partitions. The
         # reported dtypes from differing rows can be different based on the inference in
         # the limited data seen by each worker. We use pandas to compute the exact dtype
@@ -301,7 +302,7 @@ class CSVDispatcher(TextFileDispatcher):
             )
         if kwargs.get("squeeze", False) and len(new_query_compiler.columns) == 1:
             return new_query_compiler[new_query_compiler.columns[0]]
-        if index_col_md is None:
-            new_query_compiler._modin_frame._apply_index_objs(axis=0)
+        if index_col is None:
+            new_query_compiler._modin_frame.synchronize_labels(axis=0)
 
         return new_query_compiler

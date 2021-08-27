@@ -11,9 +11,11 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""Module houses class that implements ``PandasFramePartitionManager``."""
+
 import numpy as np
 
-from modin.engines.base.frame.partition_manager import BaseFrameManager
+from modin.engines.base.frame.partition_manager import PandasFramePartitionManager
 from .axis_partition import (
     PandasOnDaskFrameColumnPartition,
     PandasOnDaskFrameRowPartition,
@@ -22,38 +24,13 @@ from .partition import PandasOnDaskFramePartition
 from modin.error_message import ErrorMessage
 import pandas
 
-from distributed.client import _get_global_client
-import cloudpickle as pkl
+from distributed.client import default_client
 
 
-def deploy_func(df, apply_func, call_queue_df=None, call_queues_other=None, *others):
-    if call_queue_df is not None and len(call_queue_df) > 0:
-        for call, kwargs in call_queue_df:
-            if isinstance(call, bytes):
-                call = pkl.loads(call)
-            if isinstance(kwargs, bytes):
-                kwargs = pkl.loads(kwargs)
-            df = call(df, **kwargs)
-    new_others = np.empty(shape=len(others), dtype=object)
-    for i, call_queue_other in enumerate(call_queues_other):
-        other = others[i]
-        if call_queue_other is not None and len(call_queue_other) > 0:
-            for call, kwargs in call_queue_other:
-                if isinstance(call, bytes):
-                    call = pkl.loads(call)
-                if isinstance(kwargs, bytes):
-                    kwargs = pkl.loads(kwargs)
-                other = call(other, **kwargs)
-        new_others[i] = other
-    if isinstance(apply_func, bytes):
-        apply_func = pkl.loads(apply_func)
-    return apply_func(df, new_others)
+class PandasOnDaskFramePartitionManager(PandasFramePartitionManager):
+    """The class implements the interface in `PandasFramePartitionManager`."""
 
-
-class DaskFrameManager(BaseFrameManager):
-    """This class implements the interface in `BaseFrameManager`."""
-
-    # This object uses RayRemotePartition objects as the underlying store.
+    # This object uses PandasOnDaskFramePartition objects as the underlying store.
     _partition_class = PandasOnDaskFramePartition
     _column_partitions_class = PandasOnDaskFrameColumnPartition
     _row_partition_class = PandasOnDaskFrameRowPartition
@@ -61,21 +38,21 @@ class DaskFrameManager(BaseFrameManager):
     @classmethod
     def get_indices(cls, axis, partitions, index_func):
         """
-        This gets the internal indices stored in the partitions.
+        Get the internal indices stored in the partitions.
 
         Parameters
         ----------
-            axis : 0 or 1
-                This axis to extract the labels (0 - index, 1 - columns).
-            partitions : NumPy array
-                The array of partitions from which need to extract the labels.
-            index_func : callable
-                The function to be used to extract the function.
+        axis : {0, 1}
+            Axis to extract the labels over.
+        partitions : np.ndarray
+            The array of partitions from which need to extract the labels.
+        index_func : callable
+            The function to be used to extract the indices.
 
         Returns
         -------
-        Index
-            A Pandas Index object.
+        pandas.Index
+            A pandas Index object.
 
         Notes
         -----
@@ -83,7 +60,7 @@ class DaskFrameManager(BaseFrameManager):
         when you have deleted rows/columns internally, but do not know
         which ones were deleted.
         """
-        client = _get_global_client()
+        client = default_client()
         ErrorMessage.catch_bugs_and_request_email(not callable(index_func))
         func = cls.preprocess_func(index_func)
         if axis == 0:
@@ -104,30 +81,45 @@ class DaskFrameManager(BaseFrameManager):
 
     @classmethod
     def broadcast_apply(cls, axis, apply_func, left, right, other_name="r"):
-        def mapper(df, others):
+        """
+        Broadcast the `right` partitions to `left` and apply `apply_func` function.
+
+        Parameters
+        ----------
+        axis : {0, 1}
+            Axis to apply and broadcast over.
+        apply_func : callable
+            Function to apply.
+        left : np.ndarray
+            NumPy array of left partitions.
+        right : np.ndarray
+            NumPy array of right partitions.
+        other_name : str, default: "r"
+            Name of key-value argument for `apply_func` that
+            is used to pass `right` to `apply_func`.
+
+        Returns
+        -------
+        np.ndarray
+            NumPy array of result partition objects.
+        """
+
+        def map_func(df, *others):
             other = pandas.concat(others, axis=axis ^ 1)
             return apply_func(df, **{other_name: other})
 
-        client = _get_global_client()
+        map_func = cls.preprocess_func(map_func)
+        rt_axis_parts = cls.axis_partition(right, axis ^ 1)
         return np.array(
             [
                 [
-                    PandasOnDaskFramePartition(
-                        client.submit(
-                            deploy_func,
-                            part.future,
-                            mapper,
-                            part.call_queue,
-                            [obj[col_idx].call_queue for obj in right]
+                    part.apply(
+                        map_func,
+                        *(
+                            rt_axis_parts[col_idx].list_of_blocks
                             if axis
-                            else [obj.call_queue for obj in right[row_idx]],
-                            *(
-                                [obj[col_idx].future for obj in right]
-                                if axis
-                                else [obj.future for obj in right[row_idx]]
-                            ),
-                            pure=False,
-                        )
+                            else rt_axis_parts[row_idx].list_of_blocks
+                        ),
                     )
                     for col_idx, part in enumerate(left[row_idx])
                 ]

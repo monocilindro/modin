@@ -11,6 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
+"""The module defines interface for an axis partition with PyArrow backend and Ray engine."""
+
 from modin.engines.base.frame.axis_partition import BaseFrameAxisPartition
 from .partition import PyarrowOnRayFramePartition
 
@@ -19,23 +21,45 @@ import pyarrow
 
 
 class PyarrowOnRayFrameAxisPartition(BaseFrameAxisPartition):
+    """
+    Class defines axis partition interface with PyArrow backend and Ray engine.
+
+    Inherits functionality from ``BaseFrameAxisPartition`` class.
+
+    Parameters
+    ----------
+    list_of_blocks : list
+        List with partition objects to create common axis partition for.
+    """
+
     def __init__(self, list_of_blocks):
-        # Unwrap from BaseFramePartition object for ease of use
+        # Unwrap from PandasFramePartition object for ease of use
         self.list_of_blocks = [obj.oid for obj in list_of_blocks]
 
     def apply(self, func, num_splits=None, other_axis_partition=None, **kwargs):
-        """Applies func to the object in the plasma store.
+        """
+        Apply func to the object in the Plasma store.
 
+        Parameters
+        ----------
+        func : callable or ray.ObjectRef
+            The function to apply.
+        num_splits : int, optional
+            The number of times to split the resulting object.
+        other_axis_partition : PyarrowOnRayFrameAxisPartition, optional
+            Another ``PyarrowOnRayFrameAxisPartition`` object to apply to
+            `func` with this one.
+        **kwargs : dict
+            Additional keyward arguments to pass with `func`.
+
+        Returns
+        -------
+        list
+            List with ``PyarrowOnRayFramePartition`` objects.
+
+        Notes
+        -----
         See notes in Parent class about this method.
-
-        Args:
-            func: The function to apply.
-            num_splits: The number of times to split the result object.
-            other_axis_partition: Another `PyarrowOnRayFrameAxisPartition` object to apply to
-                func with this one.
-
-        Returns:
-            A list of `RayRemotePartition` objects.
         """
         if num_splits is None:
             num_splits = len(self.list_of_blocks)
@@ -43,10 +67,15 @@ class PyarrowOnRayFrameAxisPartition(BaseFrameAxisPartition):
         if other_axis_partition is not None:
             return [
                 PyarrowOnRayFramePartition(obj)
-                for obj in deploy_ray_func_between_two_axis_partitions._remote(
-                    args=(self.axis, func, num_splits, len(self.list_of_blocks), kwargs)
-                    + tuple(self.list_of_blocks + other_axis_partition.list_of_blocks),
-                    num_returns=num_splits,
+                for obj in deploy_ray_func_between_two_axis_partitions.options(
+                    num_returns=num_splits
+                ).remote(
+                    self.axis,
+                    func,
+                    num_splits,
+                    len(self.list_of_blocks),
+                    kwargs,
+                    *(self.list_of_blocks + other_axis_partition.list_of_blocks),
                 )
             ]
 
@@ -54,18 +83,32 @@ class PyarrowOnRayFrameAxisPartition(BaseFrameAxisPartition):
         args.extend(self.list_of_blocks)
         return [
             PyarrowOnRayFramePartition(obj)
-            for obj in deploy_ray_axis_func._remote(args, num_returns=num_splits)
+            for obj in deploy_ray_axis_func.options(num_returns=num_splits).remote(
+                *args
+            )
         ]
 
     def shuffle(self, func, num_splits=None, **kwargs):
-        """Shuffle the order of the data in this axis based on the `func`.
+        """
+        Shuffle the order of the data in this axis based on the `func`.
 
-        Extends `BaseFrameAxisPartition.shuffle`.
+        Parameters
+        ----------
+        func : callable
+            The function to apply before splitting.
+        num_splits : int, optional
+            The number of times to split the resulting object.
+        **kwargs : dict
+            Additional keywords arguments to be passed in `func`.
 
-        :param func:
-        :param num_splits:
-        :param kwargs:
-        :return:
+        Returns
+        -------
+        list
+            List with ``PyarrowOnRayFramePartition`` objects.
+
+        Notes
+        -----
+        Method extends ``BaseFrameAxisPartition.shuffle``.
         """
         if num_splits is None:
             num_splits = len(self.list_of_blocks)
@@ -74,29 +117,60 @@ class PyarrowOnRayFrameAxisPartition(BaseFrameAxisPartition):
         args.extend(self.list_of_blocks)
         return [
             PyarrowOnRayFramePartition(obj)
-            for obj in deploy_ray_axis_func._remote(args, num_returns=num_splits)
+            for obj in deploy_ray_axis_func.options(num_returns=num_splits).remote(
+                *args
+            )
         ]
 
 
 class PyarrowOnRayFrameColumnPartition(PyarrowOnRayFrameAxisPartition):
-    """The column partition implementation for Ray. All of the implementation
-    for this class is in the parent class, and this class defines the axis
-    to perform the computation over.
+    """
+    The column partition implementation for PyArrow backend and Ray engine.
+
+    All of the implementation for this class is in the ``PyarrowOnRayFrameAxisPartition``
+    parent class, and this class defines the axis to perform the computation over.
+
+    Parameters
+    ----------
+    list_of_blocks : list
+        List with partition objects to create common axis partition.
     """
 
     axis = 0
 
 
 class PyarrowOnRayFrameRowPartition(PyarrowOnRayFrameAxisPartition):
-    """The row partition implementation for Ray. All of the implementation
-    for this class is in the parent class, and this class defines the axis
-    to perform the computation over.
+    """
+    The row partition implementation for PyArrow backend and Ray engine.
+
+    All of the implementation for this class is in the ``PyarrowOnRayFrameAxisPartition``
+    parent class, and this class defines the axis to perform the computation over.
+
+    Parameters
+    ----------
+    list_of_blocks : list
+        List with partition objects to create common axis partition.
     """
 
     axis = 1
 
 
 def concat_arrow_table_partitions(axis, partitions):
+    """
+    Concatenate given `partitions` in a single table.
+
+    Parameters
+    ----------
+    axis : {0, 1}
+        The axis to concatenate over.
+    partitions : array-like
+        Array with partitions for concatenating.
+
+    Returns
+    -------
+    pyarrow.Table
+        ``pyarrow.Table`` constructed from the passed partitions.
+    """
     if axis == 0:
         table = pyarrow.Table.from_batches(
             [part.to_batches(part.num_rows)[0] for part in partitions]
@@ -114,6 +188,27 @@ def concat_arrow_table_partitions(axis, partitions):
 
 
 def split_arrow_table_result(axis, result, num_partitions, num_splits, metadata):
+    """
+    Split ``pyarrow.Table`` according to the passed parameters.
+
+    Parameters
+    ----------
+    axis : {0, 1}
+        The axis to perform the function along.
+    result : pyarrow.Table
+        Resulting table to split.
+    num_partitions : int
+        Number of partitions that `result` was constructed from.
+    num_splits : int
+        The number of splits to return.
+    metadata : dict
+        Dictionary with ``pyarrow.Table`` metadata.
+
+    Returns
+    -------
+    list
+        List of PyArrow Tables.
+    """
     chunksize = (
         num_splits // num_partitions
         if num_splits % num_partitions == 0
@@ -148,18 +243,26 @@ def split_arrow_table_result(axis, result, num_partitions, num_splits, metadata)
 
 @ray.remote
 def deploy_ray_axis_func(axis, func, num_splits, kwargs, *partitions):
-    """Deploy a function along a full axis in Ray.
+    """
+    Deploy a function along a full axis in Ray.
 
-    Args:
-        axis: The axis to perform the function along.
-        func: The function to perform.
-        num_splits: The number of splits to return
-            (see `split_result_of_axis_func_pandas`)
-        kwargs: A dictionary of keyword arguments.
-        partitions: All partitions that make up the full axis (row or column)
+    Parameters
+    ----------
+    axis : {0, 1}
+        The axis to perform the function along.
+    func : callable
+        The function to deploy.
+    num_splits : int
+        The number of splits to return.
+    kwargs : dict
+        A dictionary of keyword arguments.
+    *partitions : array-like
+        All partitions that make up the full axis (row or column).
 
-    Returns:
-        A list of Pandas DataFrames.
+    Returns
+    -------
+    list
+        List of PyArrow Tables.
     """
     table = concat_arrow_table_partitions(axis, partitions)
     try:
@@ -175,21 +278,29 @@ def deploy_ray_axis_func(axis, func, num_splits, kwargs, *partitions):
 def deploy_ray_func_between_two_axis_partitions(
     axis, func, num_splits, len_of_left, kwargs, *partitions
 ):
-    """Deploy a function along a full axis between two data sets in Ray.
+    """
+    Deploy a function along a full axis between two data sets in Ray.
 
-    Args:
-        axis: The axis to perform the function along.
-        func: The function to perform.
-        num_splits: The number of splits to return
-            (see `split_result_of_axis_func_pandas`).
-        len_of_left: The number of values in `partitions` that belong to the
-            left data set.
-        kwargs: A dictionary of keyword arguments.
-        partitions: All partitions that make up the full axis (row or column)
-            for both data sets.
+    Parameters
+    ----------
+    axis : {0, 1}
+        The axis to perform the function along.
+    func : callable
+        The function to deploy.
+    num_splits : int
+        The number of splits to return.
+    len_of_left : int
+        The number of values in `partitions` that belong to the left data set.
+    kwargs : dict
+        A dictionary of keyword arguments.
+    *partitions : array-like
+        All partitions that make up the full axis (row or column)
+        for both data sets.
 
-    Returns:
-        A list of Pandas DataFrames.
+    Returns
+    -------
+    list
+        List of PyArrow Tables.
     """
     lt_table = concat_arrow_table_partitions(axis, partitions[:len_of_left])
     rt_table = concat_arrow_table_partitions(axis, partitions[len_of_left:])
@@ -205,17 +316,24 @@ def deploy_ray_func_between_two_axis_partitions(
 
 
 @ray.remote
-def deploy_ray_shuffle_func(axis, func, numsplits, kwargs, *partitions):
-    """Deploy a function that defines the partitions along this axis.
-
-    Args:
-        axis:
-        func:
-        numsplits:
-        kwargs:
-        partitions:
-
-    Returns:
-        A list of Pandas DataFrames.
+def deploy_ray_shuffle_func(axis, func, num_splits, kwargs, *partitions):
     """
-    pass
+    Deploy shuffle function that defines the order of the data in this axis partition.
+
+    Parameters
+    ----------
+    axis : {0, 1}
+        The axis to perform the function along.
+    func : callable
+        The function to deploy.
+    num_splits : int
+        The number of splits to return.
+    kwargs : dict
+        A dictionary of keyword arguments.
+    *partitions : array-like
+        All partitions that make up the full axis (row or column).
+
+    Notes
+    -----
+    Function is deprecated.
+    """

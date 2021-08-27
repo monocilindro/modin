@@ -12,8 +12,9 @@
 # governing permissions and limitations under the License.
 
 """
-This module contains the functionality that is used when benchmarking modin commits.
-In the case of using utilities from the main modin code, there is a chance that when
+The module contains the functionality that is used when benchmarking Modin commits.
+
+In the case of using utilities from the main Modin code, there is a chance that when
 benchmarking old commits, the utilities changed, which in turn can unexpectedly affect
 the performance results, hence some utility functions are duplicated here.
 """
@@ -39,25 +40,29 @@ except ImportError:
     NPARTITIONS = pd.DEFAULT_NPARTITIONS
 
 try:
-    from modin.config import TestDatasetSize, AsvImplementation, Engine
+    from modin.config import TestDatasetSize, AsvImplementation, Engine, Backend
 
     ASV_USE_IMPL = AsvImplementation.get()
     ASV_DATASET_SIZE = TestDatasetSize.get() or "Small"
     ASV_USE_ENGINE = Engine.get()
+    ASV_USE_BACKEND = Backend.get()
 except ImportError:
     # The same benchmarking code can be run for different versions of Modin, so in
     # case of an error importing important variables, we'll just use predefined values
     ASV_USE_IMPL = os.environ.get("MODIN_ASV_USE_IMPL", "modin")
     ASV_DATASET_SIZE = os.environ.get("MODIN_TEST_DATASET_SIZE", "Small")
     ASV_USE_ENGINE = os.environ.get("MODIN_ENGINE", "Ray")
+    ASV_USE_BACKEND = os.environ.get("MODIN_BACKEND", "Pandas")
 
 ASV_USE_IMPL = ASV_USE_IMPL.lower()
 ASV_DATASET_SIZE = ASV_DATASET_SIZE.lower()
 ASV_USE_ENGINE = ASV_USE_ENGINE.lower()
+ASV_USE_BACKEND = ASV_USE_BACKEND.lower()
 
 assert ASV_USE_IMPL in ("modin", "pandas")
 assert ASV_DATASET_SIZE in ("big", "small")
 assert ASV_USE_ENGINE in ("ray", "dask", "python")
+assert ASV_USE_BACKEND in ("pandas", "omnisci", "pyarrow")
 
 BINARY_OP_DATA_SIZE = {
     "big": [
@@ -87,6 +92,15 @@ UNARY_OP_DATA_SIZE = {
     ],
 }
 
+SERIES_DATA_SIZE = {
+    "big": [
+        (100_000, 1),
+    ],
+    "small": [
+        (10_000, 1),
+    ],
+}
+
 GROUPBY_NGROUPS = {
     "big": [100, "huge_amount_groups"],
     "small": [5],
@@ -104,12 +118,13 @@ def translator_groupby_ngroups(groupby_ngroups: Union[str, int], shape: tuple) -
 
     Parameters
     ----------
-    groupby_ngroups: str or int
-        number of groups that will be used in `groupby` operation
-    shape: tuple
+    groupby_ngroups : str or int
+        Number of groups that will be used in `groupby` operation.
+    shape : tuple
+        Same as pandas.Dataframe.shape.
 
-    Return
-    ------
+    Returns
+    -------
     int
     """
     if ASV_DATASET_SIZE == "big":
@@ -120,12 +135,53 @@ def translator_groupby_ngroups(groupby_ngroups: Union[str, int], shape: tuple) -
         return groupby_ngroups
 
 
-class weakdict(dict):
+class weakdict(dict):  # noqa: GL08
     __slots__ = ("__weakref__",)
 
 
 data_cache = dict()
 dataframes_cache = dict()
+
+
+def gen_nan_data(impl: str, nrows: int, ncols: int) -> dict:
+    """
+    Generate nan data with caching.
+
+    The generated data are saved in the dictionary and on a subsequent call,
+    if the keys match, saved data will be returned. Therefore, we need
+    to carefully monitor the changing of saved data and make its copy if needed.
+
+    Parameters
+    ----------
+    impl : str
+        Implementation used to create the DataFrame or Series;
+        supported implemetations: {"modin", "pandas"}.
+    nrows : int
+        Number of rows.
+    ncols : int
+        Number of columns.
+
+    Returns
+    -------
+    modin.pandas.DataFrame or pandas.DataFrame or modin.pandas.Series or pandas.Series
+        DataFrame or Series with shape (nrows, ncols) or (nrows,), respectively.
+    """
+    cache_key = (impl, nrows, ncols)
+    if cache_key in data_cache:
+        return data_cache[cache_key]
+
+    logging.info("Generating nan data {} rows and {} columns".format(nrows, ncols))
+
+    if ncols > 1:
+        columns = [f"col{x}" for x in range(ncols)]
+        data = IMPL[impl].DataFrame(np.nan, index=pd.RangeIndex(nrows), columns=columns)
+    elif ncols == 1:
+        data = IMPL[impl].Series(np.nan, index=pd.RangeIndex(nrows))
+    else:
+        assert False, "Number of columns (ncols) should be >= 1"
+
+    data_cache[cache_key] = data
+    return data
 
 
 def gen_int_data(nrows: int, ncols: int, rand_low: int, rand_high: int) -> dict:
@@ -138,19 +194,19 @@ def gen_int_data(nrows: int, ncols: int, rand_low: int, rand_high: int) -> dict:
 
     Parameters
     ----------
-    nrows: int
-        number of rows
-    ncols: int
-        number of columns
-    rand_low: int
-        low bound for random generator
-    rand_high:int
-        high bound for random generator
+    nrows : int
+        Number of rows.
+    ncols : int
+        Number of columns.
+    rand_low : int
+        Low bound for random generator.
+    rand_high : int
+        High bound for random generator.
 
-    Return
-    ------
+    Returns
+    -------
     dict
-        ncols number of keys, storing numpy.array of nrows length
+        Number of keys - `ncols`, each of them store np.ndarray of `nrows` length.
     """
     cache_key = ("int", nrows, ncols, rand_low, rand_high)
     if cache_key in data_cache:
@@ -179,20 +235,20 @@ def gen_str_int_data(nrows: int, ncols: int, rand_low: int, rand_high: int) -> d
 
     Parameters
     ----------
-    nrows: int
-        number of rows
-    ncols: int
-        number of columns
-    rand_low: int
-        low bound for random generator
-    rand_high:int
-        high bound for random generator
+    nrows : int
+        Number of rows.
+    ncols : int
+        Number of columns.
+    rand_low : int
+        Low bound for random generator.
+    rand_high : int
+        High bound for random generator.
 
-    Return
-    ------
+    Returns
+    -------
     dict
-        ncols+1 number of keys, storing numpy.array of nrows length
-        one column with string values
+        Number of keys - `ncols`, each of them store np.ndarray of `nrows` length.
+        One of the columns with string values.
     """
     cache_key = ("str_int", nrows, ncols, rand_low, rand_high)
     if cache_key in data_cache:
@@ -204,15 +260,67 @@ def gen_str_int_data(nrows: int, ncols: int, rand_low: int, rand_high: int) -> d
         )
     )
     data = gen_int_data(nrows, ncols, rand_low, rand_high).copy()
-    data["gb_col"] = [
-        "str_{}".format(random_state.randint(rand_low, rand_high)) for i in range(nrows)
-    ]
+    # convert values in arbitary column to string type
+    key = list(data.keys())[0]
+    data[key] = [f"str_{x}" for x in data[key]]
+    data_cache[cache_key] = weakdict(data)
+    return data
+
+
+def gen_true_false_int_data(nrows, ncols, rand_low, rand_high):
+    """
+    Generate int data and string data "true" and "false" values with caching.
+
+    The generated data are saved in the dictionary and on a subsequent call,
+    if the keys match, saved data will be returned. Therefore, we need
+    to carefully monitor the changing of saved data and make its copy if needed.
+
+    Parameters
+    ----------
+    nrows : int
+        Number of rows.
+    ncols : int
+        Number of columns.
+    rand_low : int
+        Low bound for random generator.
+    rand_high : int
+        High bound for random generator.
+
+    Returns
+    -------
+    dict
+        Number of keys - `ncols`, each of them store np.ndarray of `nrows` length.
+        One half of the columns with integer values, another half - with "true" and
+        "false" string values.
+    """
+    cache_key = ("true_false_int", nrows, ncols, rand_low, rand_high)
+    if cache_key in data_cache:
+        return data_cache[cache_key]
+
+    logging.info(
+        "Generating true_false_int data {} rows and {} columns [{}-{}]".format(
+            nrows, ncols, rand_low, rand_high
+        )
+    )
+    data = gen_int_data(nrows // 2, ncols // 2, rand_low, rand_high)
+
+    data_true_false = {
+        "tf_col{}".format(i): random_state.choice(
+            ["Yes", "true", "No", "false"], size=(nrows - nrows // 2)
+        )
+        for i in range(ncols - ncols // 2)
+    }
+    data.update(data_true_false)
     data_cache[cache_key] = weakdict(data)
     return data
 
 
 def gen_data(
-    data_type: str, nrows: int, ncols: int, rand_low: int, rand_high: int
+    data_type: str,
+    nrows: int,
+    ncols: int,
+    rand_low: int,
+    rand_high: int,
 ) -> dict:
     """
     Generate data with caching.
@@ -223,29 +331,42 @@ def gen_data(
 
     Parameters
     ----------
-    data_type: str
-        type of data generation
-    nrows: int
-        number of rows
-    ncols: int
-        number of columns
-    rand_low: int
-        low bound for random generator
-    rand_high:int
-        high bound for random generator
+    data_type : {"int", "str_int", "true_false_int"}
+        Type of data generation.
+    nrows : int
+        Number of rows.
+    ncols : int
+        Number of columns.
+    rand_low : int
+        Low bound for random generator.
+    rand_high : int
+        High bound for random generator.
 
-    Return
-    ------
+    Returns
+    -------
     dict
-        ncols+1 number of keys, storing numpy.array of nrows length
-        one column with string values
+        Number of keys - `ncols`, each of them store np.ndarray of `nrows` length.
+
+    Notes
+    -----
+    Returned data type depends on the `data_type` parameter in the next way:
+    - `data_type`=="int" - all columns will be contain only integer values;
+    - `data_type`=="str_int" some of the columns will be of string type;
+    - `data_type`=="true_false_int" half of the columns will be filled with
+      string values representing "true" and "false" values and another half - with
+      integers.
     """
-    if data_type == "int":
-        return gen_int_data(nrows, ncols, rand_low, rand_high)
-    elif data_type == "str_int":
-        return gen_str_int_data(nrows, ncols, rand_low, rand_high)
-    else:
-        assert False
+    type_to_generator = {
+        "int": gen_int_data,
+        "str_int": gen_str_int_data,
+        "true_false_int": gen_true_false_int_data,
+    }
+    assert data_type in type_to_generator
+    data_generator = type_to_generator[data_type]
+
+    data = data_generator(nrows, ncols, rand_low, rand_high)
+
+    return data
 
 
 def generate_dataframe(
@@ -267,31 +388,34 @@ def generate_dataframe(
 
     Parameters
     ----------
-    impl: str
-        implementation used to create the dataframe;
-        supported implemetations: {"modin", "pandas"}
-    data_type: str
-        type of data generation;
-        supported types: {"int", "str_int"}
-    nrows: int
-        number of rows
-    ncols: int
-        number of columns
-    rand_low: int
-        low bound for random generator
-    rand_high: int
-        high bound for random generator
-    groupby_ncols: int or None
-        number of columns for which `groupby` will be called in the future;
+    impl : str
+        Implementation used to create the dataframe;
+        supported implemetations: {"modin", "pandas"}.
+    data_type : str
+        Type of data generation;
+        supported types: {"int", "str_int"}.
+    nrows : int
+        Number of rows.
+    ncols : int
+        Number of columns.
+    rand_low : int
+        Low bound for random generator.
+    rand_high : int
+        High bound for random generator.
+    groupby_ncols : int, default: None
+        Number of columns for which `groupby` will be called in the future;
         to get more stable performance results, we need to have the same number of values
-        in each group every benchmarking time
-    count_groups: int or None
-        count of groups in groupby columns
+        in each group every benchmarking time.
+    count_groups : int, default: None
+        Count of groups in groupby columns.
 
-    Return
-    ------
-    modin.DataFrame or pandas.DataFrame [and list of groupby columns names if
-        columns for groupby were generated]
+    Returns
+    -------
+    modin.pandas.DataFrame or pandas.DataFrame [and list]
+
+    Notes
+    -----
+    The list of groupby columns names returns when groupby columns are generated.
     """
     assert not (
         (groupby_ncols is None) ^ (count_groups is None)
@@ -345,8 +469,8 @@ def random_string() -> str:
     """
     Create a 36-character random string.
 
-    Return
-    ------
+    Returns
+    -------
     str
     """
     return str(uuid.uuid4())
@@ -358,13 +482,13 @@ def random_columns(df_columns: list, columns_number: int) -> list:
 
     Parameters
     ----------
-    df_columns: list
-        columns to choose from
-    columns_number: int
-        how many columns to pick
+    df_columns : list
+        Columns to choose from.
+    columns_number : int
+        How many columns to pick.
 
-    Return
-    ------
+    Returns
+    -------
     list
     """
     return list(random_state.choice(df_columns, size=columns_number))
@@ -376,25 +500,63 @@ def random_booleans(number: int) -> list:
 
     Parameters
     ----------
-    number: int
-        count of booleans in result list
+    number : int
+        Count of booleans in result list.
 
-    Return
-    ------
+    Returns
+    -------
     list
     """
     return list(random_state.choice([True, False], size=number))
 
 
-def execute(df: Union[pd.DataFrame, pandas.DataFrame]):
+def trigger_import(*dfs):
+    """
+    Trigger import execution for DataFrames obtained by OmniSci engine.
+
+    Parameters
+    ----------
+    *dfs : iterable
+        DataFrames to trigger import.
+    """
+    assert ASV_USE_BACKEND == "omnisci"
+
+    from modin.experimental.engines.omnisci_on_ray.frame.omnisci_worker import (
+        OmnisciServer,
+    )
+
+    for df in dfs:
+        if ASV_USE_IMPL == "modin":
+            df.shape  # to trigger real execution
+            df._query_compiler._modin_frame._partitions[0][
+                0
+            ].frame_id = OmnisciServer().put_arrow_to_omnisci(
+                df._query_compiler._modin_frame._partitions[0][0].get()
+            )  # to trigger real execution
+        elif ASV_USE_IMPL == "pandas":
+            pass
+
+
+def execute(
+    df: Union[pd.DataFrame, pandas.DataFrame], trigger_omnisci_import: bool = False
+):
     """
     Make sure the calculations are finished.
 
     Parameters
     ----------
-    df: modin.DataFrame of pandas.Datarame
+    df : modin.pandas.DataFrame or pandas.Datarame
+        DataFrame to be executed.
+    trigger_omnisci_import : bool, default: False
+        Whether `df` are obtained by import with OmniSci engine.
     """
+    if trigger_omnisci_import:
+        trigger_import(df)
+        return
     if ASV_USE_IMPL == "modin":
+        if ASV_USE_BACKEND == "omnisci":
+            df._query_compiler._modin_frame._execute()
+            return
         partitions = df._query_compiler._modin_frame._partitions
         all(
             map(
@@ -423,10 +585,40 @@ def get_shape_id(shape: tuple) -> str:
 
     Parameters
     ----------
-    shape: tuple
+    shape : tuple
+        Same as pandas.Dataframe.shape.
 
-    Return
-    ------
+    Returns
+    -------
     str
     """
     return "_".join([str(element) for element in shape])
+
+
+def prepare_io_data(test_filename: str, data_type: str, shapes: list):
+    """
+    Prepare data for IO tests with caching.
+
+    Parameters
+    ----------
+    test_filename : str
+        Unique file identifier that is used to distinguish data
+        for different tests.
+    data_type : {"int", "str_int", "true_false_int"}
+        Type of data generation.
+    shapes : list
+        Data shapes to prepare.
+
+    Returns
+    -------
+    test_filenames : dict
+        Dictionary that maps dataset shape to the file on disk.
+    """
+    test_filenames = {}
+    for shape in shapes:
+        shape_id = get_shape_id(shape)
+        test_filenames[shape_id] = f"{test_filename}_{shape_id}.csv"
+        df = generate_dataframe("pandas", data_type, *shape, RAND_LOW, RAND_HIGH)
+        df.to_csv(test_filenames[shape_id], index=False)
+
+    return test_filenames

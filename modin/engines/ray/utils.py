@@ -11,39 +11,39 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
-import builtins
+"""The module holds utility and initialization routines for Modin on Ray."""
+
 import os
 import sys
+import psutil
+import warnings
 
 from modin.config import (
     Backend,
     IsRayCluster,
     RayRedisAddress,
+    RayRedisPassword,
     CpuCount,
     GpuCount,
     Memory,
-    RayPlasmaDir,
-    IsOutOfCore,
     NPartitions,
 )
 
 
-def handle_ray_task_error(e):
-    for s in e.traceback_str.split("\n")[::-1]:
-        if "Error" in s or "Exception" in s:
-            try:
-                raise getattr(builtins, s.split(":")[0])("".join(s.split(":")[1:]))
-            except AttributeError as att_err:
-                if "module" in str(att_err) and builtins.__name__ in str(att_err):
-                    pass
-                else:
-                    raise att_err
-    raise e
-
-
-# Register a fix import function to run on all_workers including the driver.
-# This is a hack solution to fix #647, #746
 def _move_stdlib_ahead_of_site_packages(*args):
+    """
+    Ensure packages from stdlib have higher import priority than from site-packages.
+
+    Parameters
+    ----------
+    *args : tuple
+        Ignored, added for compatibility with Ray.
+
+    Notes
+    -----
+    This function is expected to be run on all workers including the driver.
+    This is a hack solution to fix GH-#647, GH-#746.
+    """
     site_packages_path = None
     site_packages_path_index = -1
     for i, path in enumerate(sys.path):
@@ -64,10 +64,23 @@ def _move_stdlib_ahead_of_site_packages(*args):
         sys.path.insert(site_packages_path_index, os.path.dirname(site_packages_path))
 
 
-# Register a fix to import pandas on all workers before running tasks.
-# This prevents a race condition between two threads deserializing functions
-# and trying to import pandas at the same time.
 def _import_pandas(*args):
+    """
+    Import pandas to make sure all its machinery is ready.
+
+    This prevents a race condition between two threads deserializing functions
+    and trying to import pandas at the same time.
+
+    Parameters
+    ----------
+    *args : tuple
+        Ignored, added for compatibility with Ray.
+
+    Notes
+    -----
+    This function is expected to be run on all workers before any
+    serialization or deserialization starts.
+    """
     import pandas  # noqa F401
 
 
@@ -77,31 +90,29 @@ def initialize_ray(
     override_redis_password: str = None,
 ):
     """
-    Initializes ray based on parameters, environment variables and internal defaults.
+    Initialize Ray based on parameters, ``modin.config`` variables and internal defaults.
 
     Parameters
     ----------
-    override_is_cluster: bool, optional
-        Whether to override the detection of Moding being run in a cluster
+    override_is_cluster : bool, default: False
+        Whether to override the detection of Modin being run in a cluster
         and always assume this runs on cluster head node.
-        This also overrides Ray worker detection and always runs the function,
-        not only from main thread.
-        If not specified, $MODIN_RAY_CLUSTER env variable is used.
-    override_redis_address: str, optional
+        This also overrides Ray worker detection and always runs the initialization
+        function (runs from main thread only by default).
+        If not specified, ``modin.config.IsRayCluster`` variable is used.
+    override_redis_address : str, optional
         What Redis address to connect to when running in Ray cluster.
-        If not specified, $MODIN_REDIS_ADDRESS is used.
-    override_redis_password: str, optional
+        If not specified, ``modin.config.RayRedisAddress`` is used.
+    override_redis_password : str, optional
         What password to use when connecting to Redis.
-        If not specified, a new random one is generated.
+        If not specified, ``modin.config.RayRedisPassword`` is used.
     """
     import ray
 
     if not ray.is_initialized() or override_is_cluster:
-        import secrets
-
         cluster = override_is_cluster or IsRayCluster.get()
         redis_address = override_redis_address or RayRedisAddress.get()
-        redis_password = override_redis_password or secrets.token_hex(32)
+        redis_password = override_redis_password or RayRedisPassword.get()
 
         if cluster:
             # We only start ray in a cluster setting for the head node.
@@ -110,7 +121,6 @@ def initialize_ray(
                 include_dashboard=False,
                 ignore_reinit_error=True,
                 _redis_password=redis_password,
-                logging_level=100,
             )
         else:
             from modin.error_message import ErrorMessage
@@ -125,31 +135,26 @@ def initialize_ray(
 """,
             )
             object_store_memory = Memory.get()
-            plasma_directory = RayPlasmaDir.get()
-            if IsOutOfCore.get():
-                if plasma_directory is None:
-                    from tempfile import gettempdir
-
-                    plasma_directory = gettempdir()
-                # We may have already set the memory from the environment variable, we don't
-                # want to overwrite that value if we have.
-                if object_store_memory is None:
-                    # Round down to the nearest Gigabyte.
-                    try:
-                        system_memory = ray._private.utils.get_system_memory()
-                    except AttributeError:  # Compatibility with Ray <= 1.2
-                        system_memory = ray.utils.get_system_memory()
-                    mem_bytes = system_memory // 10 ** 9 * 10 ** 9
-                    # Default to 8x memory for out of core
-                    object_store_memory = 8 * mem_bytes
             # In case anything failed above, we can still improve the memory for Modin.
             if object_store_memory is None:
-                # Round down to the nearest Gigabyte.
-                try:
-                    system_memory = ray._private.utils.get_system_memory()
-                except AttributeError:  # Compatibility with Ray <= 1.2
-                    system_memory = ray.utils.get_system_memory()
-                object_store_memory = int(0.6 * system_memory // 10 ** 9 * 10 ** 9)
+                virtual_memory = psutil.virtual_memory().total
+                if sys.platform.startswith("linux"):
+                    shm_fd = os.open("/dev/shm", os.O_RDONLY)
+                    try:
+                        shm_stats = os.fstatvfs(shm_fd)
+                        system_memory = shm_stats.f_bsize * shm_stats.f_bavail
+                        if system_memory / (virtual_memory / 2) < 0.99:
+                            warnings.warn(
+                                f"The size of /dev/shm is too small ({system_memory} bytes). The required size "
+                                f"at least half of RAM ({virtual_memory // 2} bytes). Please, delete files in /dev/shm or "
+                                "increase size of /dev/shm with --shm-size in Docker. Also, you can set "
+                                "the required memory size for each Ray worker in bytes to MODIN_MEMORY environment variable."
+                            )
+                    finally:
+                        os.close(shm_fd)
+                else:
+                    system_memory = virtual_memory
+                object_store_memory = int(0.6 * system_memory // 1e9 * 1e9)
                 # If the memory pool is smaller than 2GB, just use the default in ray.
                 if object_store_memory == 0:
                     object_store_memory = None
@@ -161,27 +166,12 @@ def initialize_ray(
                 "num_gpus": GpuCount.get(),
                 "include_dashboard": False,
                 "ignore_reinit_error": True,
-                "_plasma_directory": plasma_directory,
                 "object_store_memory": object_store_memory,
                 "address": redis_address,
                 "_redis_password": redis_password,
-                "logging_level": 100,
                 "_memory": object_store_memory,
-                "_lru_evict": True,
             }
-            from packaging import version
-
-            # setting of `_lru_evict` parameter raises DeprecationWarning since ray 2.0.0.dev0
-            if version.parse(ray.__version__) >= version.parse("2.0.0.dev0"):
-                ray_init_kwargs.pop("_lru_evict")
             ray.init(**ray_init_kwargs)
-
-        _move_stdlib_ahead_of_site_packages()
-        ray.worker.global_worker.run_function_on_all_workers(
-            _move_stdlib_ahead_of_site_packages
-        )
-
-        ray.worker.global_worker.run_function_on_all_workers(_import_pandas)
 
         if Backend.get() == "Cudf":
             from modin.engines.ray.cudf_on_ray.frame.gpu_manager import GPUManager
@@ -193,7 +183,11 @@ def initialize_ray(
             if not GPU_MANAGERS:
                 for i in range(GpuCount.get()):
                     GPU_MANAGERS.append(GPUManager.remote(i))
-
+    _move_stdlib_ahead_of_site_packages()
+    ray.worker.global_worker.run_function_on_all_workers(
+        _move_stdlib_ahead_of_site_packages
+    )
+    ray.worker.global_worker.run_function_on_all_workers(_import_pandas)
     num_cpus = int(ray.cluster_resources()["CPU"])
     num_gpus = int(ray.cluster_resources().get("GPU", 0))
     if Backend.get() == "Cudf":
